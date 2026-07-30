@@ -1,0 +1,44 @@
+name: NeoForge Build
+
+on:
+  push:
+    branches:
+      - main
+      - feature/**
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: ソースを取得
+        uses: actions/checkout@v6
+
+      - name: Java 25をセットアップ
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Gradle 9.2.1をセットアップ
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '9.2.1'
+          cache-provider: basic
+
+      - name: ビルド
+        run: gradle --no-daemon clean build
+
+      - name: ビルド成果物を保存
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ivrm-player-bridge-${{ github.sha }}
+          path: build/libs/*.jar
+          if-no-files-found: error
+          retention-days: 14
