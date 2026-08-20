@@ -7,6 +7,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.TriState;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.neoforge.common.NeoForge;
@@ -127,8 +128,50 @@ public final class IvrmPermissionControl {
     @SubscribeEvent
     public void onToss(ItemTossEvent event) {
         ServerPlayer player = serverPlayer(event.getPlayer());
-        if (player != null && deny(player, PICKUP)) {
+        if (player == null || !deny(player, PICKUP)) {
+            return;
+        }
+
+        ItemStack remaining = event.getEntity().getItem().copy();
+        player.getInventory().add(remaining);
+        restoreToCarriedSlot(player, remaining);
+        player.containerMenu.broadcastChanges();
+
+        if (remaining.isEmpty()) {
             event.setCanceled(true);
+            return;
+        }
+
+        // Canceling ItemTossEvent after only a partial restore would delete the remainder.
+        // Preserve data over enforcement in this exceptional case and let only the remainder enter the world.
+        event.getEntity().setItem(remaining);
+        LOGGER.error(
+                "拒否したアイテムドロップを完全復元できなかったため残量のみワールドへ保持します: player={}, count={}",
+                player.getGameProfile().name(), remaining.getCount());
+    }
+
+    private static void restoreToCarriedSlot(ServerPlayer player, ItemStack remaining) {
+        if (remaining.isEmpty()) {
+            return;
+        }
+
+        ItemStack carried = player.containerMenu.getCarried();
+        if (carried.isEmpty()) {
+            player.containerMenu.setCarried(remaining.copy());
+            remaining.setCount(0);
+            return;
+        }
+
+        if (!ItemStack.isSameItemSameComponents(carried, remaining)) {
+            return;
+        }
+
+        int available = Math.max(0, carried.getMaxStackSize() - carried.getCount());
+        int restored = Math.min(available, remaining.getCount());
+        if (restored > 0) {
+            carried.grow(restored);
+            remaining.shrink(restored);
+            player.containerMenu.setCarried(carried);
         }
     }
 
@@ -154,8 +197,10 @@ public final class IvrmPermissionControl {
 
     private static void notifyDenied(ServerPlayer player) {
         long now = System.currentTimeMillis();
-        Long previous = LAST_MESSAGE.put(player.getUUID(), now);
+        UUID playerId = player.getUUID();
+        Long previous = LAST_MESSAGE.get(playerId);
         if (previous == null || now - previous >= MESSAGE_COOLDOWN_MILLIS) {
+            LAST_MESSAGE.put(playerId, now);
             player.sendSystemMessage(DENIED);
         }
     }
