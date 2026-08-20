@@ -52,7 +52,9 @@ The target module is therefore pinned to:
 - NeoForge `26.1.2.81`
 - Java `25`
 
-CI must prove that the existing implementation compiles against `.81`. If it does not, do not upgrade production just to make this migration pass. Instead, identify the exact API incompatibility and either adapt the implementation to `.81` or make a separate runtime-upgrade decision.
+CI must prove that the implementation compiles against `.81`. Do not upgrade production only to make this migration pass. If an API moved between the versions, adapt the implementation to the current `.81` baseline or make a separate runtime-upgrade decision.
+
+The block-break event is one confirmed example: the `.81` baseline uses `BreakBlockEvent`, so the migrated implementation uses that API instead of the later/older nested `BlockEvent.BreakEvent` form.
 
 ## Validation
 
@@ -77,29 +79,43 @@ Before source cleanup:
    - break/place denied
    - block/item/entity interaction denied
    - combat denied
-   - pickup/drop denied
+   - pickup denied
+   - Q-drop denied without item loss
+   - drag-and-drop outside inventory denied without item loss
+   - full-inventory edge case preserves every item even if enforcement must fail open for an unrecoverable remainder
 6. Test an approved member with existing LuckPerms nodes.
 7. Restart the server and repeat a minimal smoke test.
 8. Verify Main and Resource separately when both load the integration.
 
 ## Cutover
 
+The source and target JARs intentionally declare the same MOD ID. They must never be co-installed.
+
 Only after validation:
 
-1. Deploy the target JAR generated from `ivrm-mcmod`.
-2. Update the modpack manifest/SHA lock in `ivrm-dailytech-adventure`.
-3. Record deployed SHA-256 and source commit.
-4. Keep the previous known-good JAR for rollback.
-5. Remove `ivrm-dailytech-adventure/mods/ivrm-permission-control` in a separate PR.
-6. Remove stale CI/docs references to the old source path.
+1. Record the currently deployed JAR filename, SHA-256 and source commit.
+2. Stop the affected Minecraft server.
+3. Remove the old permission-control JAR from the runtime `mods` directory.
+4. Install the target JAR generated from `ivrm-mcmod`.
+5. Before startup, inspect the runtime JAR set and verify **exactly one** JAR declares MOD ID `ivrm_permission_control`.
+6. Start the server and run the permission smoke tests.
+7. Update the modpack manifest/SHA lock in `ivrm-dailytech-adventure` only after the runtime test succeeds.
+8. Record the deployed target SHA-256 and source commit.
+9. Keep the previous known-good JAR outside the active `mods` directory for rollback.
+10. Remove `ivrm-dailytech-adventure/mods/ivrm-permission-control` source in a separate PR.
+11. Remove stale CI/docs references to the old source path.
+
+Do not copy the new JAR beside the old JAR and rely on filename differences. MOD ID uniqueness, not filename uniqueness, is the startup safety condition.
 
 ## Rollback
 
 If permission behavior changes unexpectedly:
 
 1. Stop the affected Minecraft server.
-2. Restore the previous known-good JAR.
-3. Restore the previous manifest/SHA lock if it had already changed.
-4. Start the server.
-5. Verify LuckPerms-backed approved users and default-denied users.
-6. Keep the source cleanup PR unmerged until the cause is understood.
+2. Remove the target JAR from the active `mods` directory.
+3. Restore the previous known-good JAR.
+4. Verify **exactly one** active JAR declares MOD ID `ivrm_permission_control` before startup.
+5. Restore the previous manifest/SHA lock if it had already changed.
+6. Start the server.
+7. Verify LuckPerms-backed approved users and default-denied users.
+8. Keep the source cleanup PR unmerged until the cause is understood.
