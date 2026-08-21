@@ -11,7 +11,7 @@ description='''NeoForge PermissionAPI経由で未承認ユーザーのワール�
 [[dependencies.${mod_id}]]
 modId="neoforge"
 type="required"
-versionRange="[${neo_version},)"
+versionRange="[${neo_version}]"
 ordering="NONE"
 side="SERVER"
 
