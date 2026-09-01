@@ -1,10 +1,15 @@
 package jp.ivrm.playerbridge;
 
 import com.mojang.logging.LogUtils;
+import jp.ivrm.playerbridge.activity.ActivityConfig;
+import jp.ivrm.playerbridge.activity.ActivityRuntime;
+import jp.ivrm.playerbridge.activity.NeoForgeActivityEvents;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.common.Mod;
+import net.neoforged.fml.loading.FMLPaths;
+import net.neoforged.neoforge.common.NeoForge;
 import org.slf4j.Logger;
 
 /**
@@ -21,5 +26,24 @@ public final class IvrmPlayerBridge {
 
     public IvrmPlayerBridge(IEventBus modEventBus, ModContainer modContainer) {
         LOGGER.info("IVRM Player Bridge initialized (server-only foundation)");
+        initializeActivitySender();
+    }
+
+    private static void initializeActivitySender() {
+        try {
+            ActivityConfig config = ActivityConfig.load(FMLPaths.GAMEDIR.get());
+            if (!config.enabled()) {
+                LOGGER.info("IVRM Activity sender is disabled: {}", config.summary());
+                return;
+            }
+
+            ActivityRuntime runtime = new ActivityRuntime(config, LOGGER);
+            NeoForge.EVENT_BUS.register(new NeoForgeActivityEvents(runtime));
+            runtime.start();
+        } catch (RuntimeException exception) {
+            // Activity reporting must never prevent the Minecraft server from starting.
+            // Do not log configuration values here because they can include credentials.
+            LOGGER.error("IVRM Activity sender could not initialize and remains disabled: {}", exception.getMessage());
+        }
     }
 }
