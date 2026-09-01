@@ -114,8 +114,15 @@ public final class ActivityConfig {
 
     private static void validateBaseUri(URI baseUri) {
         String scheme = baseUri.getScheme();
-        if (scheme == null || baseUri.getHost() == null) {
-            throw new IllegalArgumentException("IVRM_ACTIVITY_BASE_URL must be an absolute HTTP(S) URL");
+        if (scheme == null || baseUri.getHost() == null || baseUri.isOpaque()) {
+            throw new IllegalArgumentException("IVRM_ACTIVITY_BASE_URL must be an absolute HTTP(S) origin");
+        }
+        if (baseUri.getUserInfo() != null || baseUri.getQuery() != null || baseUri.getFragment() != null) {
+            throw new IllegalArgumentException("IVRM_ACTIVITY_BASE_URL must not contain credentials, query, or fragment");
+        }
+        String path = baseUri.getPath();
+        if (path != null && !path.isEmpty() && !"/".equals(path)) {
+            throw new IllegalArgumentException("IVRM_ACTIVITY_BASE_URL must be an origin without a path");
         }
         if ("https".equalsIgnoreCase(scheme)) {
             return;
