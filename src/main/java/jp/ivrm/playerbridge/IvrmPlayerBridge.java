@@ -42,8 +42,11 @@ public final class IvrmPlayerBridge {
             runtime.start();
         } catch (RuntimeException exception) {
             // Activity reporting must never prevent the Minecraft server from starting.
-            // Do not log configuration values here because they can include credentials.
-            LOGGER.error("IVRM Activity sender could not initialize and remains disabled: {}", exception.getMessage());
+            // Never log the exception message here: configuration parsing failures can
+            // contain operator-supplied values and therefore potentially credentials.
+            LOGGER.error(
+                    "IVRM Activity sender could not initialize and remains disabled: reasonType={}",
+                    exception.getClass().getSimpleName());
         }
     }
 }
