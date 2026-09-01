@@ -53,6 +53,9 @@ configurations {
 
 dependencies {
     testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+    // NeoForge supplies Gson to the main mod compile/runtime classpath, but that
+    // transitive does not reach the standalone unit-test source set.
+    testImplementation 'com.google.code.gson:gson:2.14.0'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.11.4'
 }
 
