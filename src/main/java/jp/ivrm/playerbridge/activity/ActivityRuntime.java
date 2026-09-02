@@ -32,11 +32,13 @@ public final class ActivityRuntime implements AutoCloseable {
     private final Clock clock;
     private final AtomicLong sequence = new AtomicLong();
     private final ArrayBlockingQueue<PendingEvent> ingress;
+    private final Object ingressLifecycleLock = new Object();
     private final Object persistenceLock = new Object();
     private final DurableActivityQueue queue;
     private final ActivityHttpClient httpClient;
     private final ScheduledExecutorService dispatcher;
     private volatile boolean started;
+    private volatile boolean closing;
 
     public ActivityRuntime(ActivityConfig config, Logger logger) {
         this(config, logger, Clock.systemUTC());
@@ -78,12 +80,18 @@ public final class ActivityRuntime implements AutoCloseable {
         return queue.size() + ingress.size();
     }
 
+    boolean acceptingEvents() {
+        return enabled() && !closing;
+    }
+
     public void start() {
-        if (!enabled() || started) {
-            return;
+        synchronized (ingressLifecycleLock) {
+            if (!enabled() || started || closing) {
+                return;
+            }
+            started = true;
+            dispatcher.scheduleWithFixedDelay(this::safeDrain, 0, 1, TimeUnit.SECONDS);
         }
-        started = true;
-        dispatcher.scheduleWithFixedDelay(this::safeDrain, 0, 1, TimeUnit.SECONDS);
         logger.info("IVRM Activity sender started: {}", config.summary());
     }
 
@@ -105,11 +113,17 @@ public final class ActivityRuntime implements AutoCloseable {
                 sequence.getAndIncrement(),
                 attributes);
         PendingEvent pending = new PendingEvent(event.eventId(), event.toJson(), occurredAt, type);
-        if (!ingress.offer(pending)) {
-            logger.error(
-                    "Activity in-memory ingress is full; event could not be accepted without blocking gameplay: eventId={}, type={}",
-                    event.eventId(),
-                    type);
+        synchronized (ingressLifecycleLock) {
+            if (closing) {
+                logger.warn("Activity event rejected during shutdown: eventId={}, type={}", event.eventId(), type);
+                return;
+            }
+            if (!ingress.offer(pending)) {
+                logger.error(
+                        "Activity in-memory ingress is full; event could not be accepted without blocking gameplay: eventId={}, type={}",
+                        event.eventId(),
+                        type);
+            }
         }
     }
 
@@ -192,8 +206,17 @@ public final class ActivityRuntime implements AutoCloseable {
 
         DurableActivityQueue.QueueEntry entry = due.get();
         try {
-            int statusCode = httpClient.send(entry);
+            ActivityHttpClient.SendResult result = httpClient.send(entry);
+            int statusCode = result.statusCode();
             if (statusCode == 200 || statusCode == 202) {
+                if (!result.validAcknowledgement()) {
+                    scheduleRetry(entry, "invalid_acknowledgement");
+                    logger.warn(
+                            "Activity API returned an invalid acknowledgement; event retained for retry: eventId={}, status={}",
+                            entry.eventId(),
+                            statusCode);
+                    return false;
+                }
                 return queue.markSuccess(entry.eventId());
             }
             if (statusCode == 409) {
@@ -263,6 +286,13 @@ public final class ActivityRuntime implements AutoCloseable {
 
     @Override
     public void close() {
+        synchronized (ingressLifecycleLock) {
+            if (closing) {
+                return;
+            }
+            closing = true;
+        }
+
         boolean persisted = false;
         try {
             persisted = persistAllIngressForShutdown();
