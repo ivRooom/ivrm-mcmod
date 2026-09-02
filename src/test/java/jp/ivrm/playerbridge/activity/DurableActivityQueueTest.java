@@ -2,6 +2,7 @@ package jp.ivrm.playerbridge.activity;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
@@ -49,6 +50,25 @@ final class DurableActivityQueueTest {
         String deadLetter = Files.readString(paths.deadLetter, StandardCharsets.UTF_8);
         assertTrue(deadLetter.contains("\"eventId\":\"two\""));
         assertTrue(deadLetter.contains("\"reason\":\"queue_full\""));
+    }
+
+    @Test
+    void restoreOverflowFailureAbortsWithoutQuarantiningValidRecord() throws Exception {
+        Paths paths = paths();
+        DurableActivityQueue original = queue(paths, 2);
+        assertEquals(
+                DurableActivityQueue.EnqueueResult.ACTIVE,
+                original.enqueue("one", "{\"value\":1}", Instant.parse("2026-09-02T00:00:00Z")));
+        assertEquals(
+                DurableActivityQueue.EnqueueResult.ACTIVE,
+                original.enqueue("two", "{\"value\":2}", Instant.parse("2026-09-02T00:00:01Z")));
+        String originalJournal = Files.readString(paths.queue, StandardCharsets.UTF_8);
+
+        Files.createDirectory(paths.deadLetter);
+        assertThrows(IllegalStateException.class, () -> queue(paths, 1));
+
+        assertEquals(originalJournal, Files.readString(paths.queue, StandardCharsets.UTF_8));
+        assertFalse(Files.exists(paths.corrupt));
     }
 
     @Test
