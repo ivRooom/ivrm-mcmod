@@ -4,26 +4,32 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 
 /**
- * Owns the durable queue and background dispatcher. Gameplay threads only
- * serialize and append events; they never wait for the Activity API.
+ * Owns the bounded ingress, durable journal and background dispatcher.
+ * Gameplay threads only serialize and offer events to memory; all filesystem
+ * and HTTP I/O runs on the dispatcher thread.
  */
 public final class ActivityRuntime implements AutoCloseable {
+    private static final int MAX_PERSIST_PER_CYCLE = 100;
     private static final int MAX_DRAIN_PER_CYCLE = 50;
     private static final long MAX_BACKOFF_MILLIS = TimeUnit.MINUTES.toMillis(5);
+
+    private record PendingEvent(String eventId, String body, Instant occurredAt, String type) {}
 
     private final ActivityConfig config;
     private final Logger logger;
     private final Clock clock;
     private final AtomicLong sequence = new AtomicLong();
+    private final ArrayBlockingQueue<PendingEvent> ingress;
     private final DurableActivityQueue queue;
     private final ActivityHttpClient httpClient;
     private final ScheduledExecutorService dispatcher;
@@ -37,6 +43,7 @@ public final class ActivityRuntime implements AutoCloseable {
         this.config = config;
         this.logger = logger;
         this.clock = clock;
+        this.ingress = new ArrayBlockingQueue<>(config.maxQueueEntries());
         this.queue = new DurableActivityQueue(
                 config.queuePath(),
                 config.deadLetterPath(),
@@ -65,7 +72,7 @@ public final class ActivityRuntime implements AutoCloseable {
     }
 
     public int queuedEvents() {
-        return queue.size();
+        return queue.size() + ingress.size();
     }
 
     public void start() {
@@ -94,13 +101,16 @@ public final class ActivityRuntime implements AutoCloseable {
                 occurredAt,
                 sequence.getAndIncrement(),
                 attributes);
-        boolean queued = queue.enqueue(event.eventId(), event.toJson(), occurredAt);
-        if (!queued) {
-            logger.error("Activity event could not enter the active queue: eventId={}, type={}", event.eventId(), type);
+        PendingEvent pending = new PendingEvent(event.eventId(), event.toJson(), occurredAt, type);
+        if (!ingress.offer(pending)) {
+            logger.error(
+                    "Activity in-memory ingress is full; event could not be accepted without blocking gameplay: eventId={}, type={}",
+                    event.eventId(),
+                    type);
         }
     }
 
-    /** Schedules an immediate background drain without blocking the caller. */
+    /** Schedules an immediate background persistence/drain without blocking the caller. */
     public void flushAsync() {
         if (enabled() && !dispatcher.isShutdown()) {
             dispatcher.execute(this::safeDrain);
@@ -109,14 +119,47 @@ public final class ActivityRuntime implements AutoCloseable {
 
     private void safeDrain() {
         try {
+            if (!persistIngress()) {
+                return;
+            }
             for (int count = 0; count < MAX_DRAIN_PER_CYCLE; count++) {
                 if (!drainOne()) {
                     break;
                 }
             }
         } catch (RuntimeException exception) {
-            logger.error("Unexpected Activity dispatcher failure; queue remains durable", exception);
+            logger.error("Unexpected Activity dispatcher failure; queued state is retained", exception);
         }
+    }
+
+    /**
+     * Moves ingress events to the fsynced journal before any network attempt.
+     * The head remains in memory when neither the active journal nor the
+     * dead-letter journal can be persisted.
+     */
+    private boolean persistIngress() {
+        for (int count = 0; count < MAX_PERSIST_PER_CYCLE; count++) {
+            PendingEvent pending = ingress.peek();
+            if (pending == null) {
+                return true;
+            }
+
+            DurableActivityQueue.EnqueueResult result =
+                    queue.enqueue(pending.eventId(), pending.body(), pending.occurredAt());
+            if (result == DurableActivityQueue.EnqueueResult.RETRY_NEEDED) {
+                logger.warn("Activity persistence unavailable; ingress head retained for retry");
+                return false;
+            }
+
+            ingress.poll();
+            if (result == DurableActivityQueue.EnqueueResult.DEAD_LETTERED) {
+                logger.error(
+                        "Activity event bypassed active queue and was preserved in dead-letter: eventId={}, type={}",
+                        pending.eventId(),
+                        pending.type());
+            }
+        }
+        return true;
     }
 
     boolean drainOne() {
@@ -129,23 +172,32 @@ public final class ActivityRuntime implements AutoCloseable {
         try {
             int statusCode = httpClient.send(entry);
             if (statusCode == 200 || statusCode == 202) {
-                queue.markSuccess(entry.eventId());
-                return true;
+                return queue.markSuccess(entry.eventId());
             }
             if (statusCode == 409) {
-                queue.moveToDeadLetter(entry.eventId(), "http_409_event_conflict");
-                logger.error("Activity event conflict moved to dead-letter: eventId={}", entry.eventId());
-                return true;
+                boolean moved = queue.moveToDeadLetter(entry.eventId(), "http_409_event_conflict");
+                if (moved) {
+                    logger.error("Activity event conflict moved to dead-letter: eventId={}", entry.eventId());
+                } else {
+                    logger.error("Activity event conflict could not be dead-lettered; active event retained: eventId={}",
+                            entry.eventId());
+                }
+                return moved;
             }
             if (isRetryableStatus(statusCode)) {
                 scheduleRetry(entry, "http_" + statusCode);
                 return false;
             }
 
-            queue.moveToDeadLetter(entry.eventId(), "permanent_http_" + statusCode);
-            logger.error("Permanent Activity HTTP failure moved to dead-letter: eventId={}, status={}",
-                    entry.eventId(), statusCode);
-            return true;
+            boolean moved = queue.moveToDeadLetter(entry.eventId(), "permanent_http_" + statusCode);
+            if (moved) {
+                logger.error("Permanent Activity HTTP failure moved to dead-letter: eventId={}, status={}",
+                        entry.eventId(), statusCode);
+            } else {
+                logger.error("Permanent Activity HTTP failure could not be dead-lettered; active event retained: eventId={}, status={}",
+                        entry.eventId(), statusCode);
+            }
+            return moved;
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             scheduleRetry(entry, "interrupted");
@@ -160,12 +212,20 @@ public final class ActivityRuntime implements AutoCloseable {
     private void scheduleRetry(DurableActivityQueue.QueueEntry entry, String reason) {
         int nextAttempt = entry.attempts() + 1;
         if (nextAttempt >= config.maxAttempts()) {
-            queue.moveToDeadLetter(entry.eventId(), "retry_exhausted_" + reason);
-            logger.error("Activity retry limit reached; event moved to dead-letter: eventId={}", entry.eventId());
+            boolean moved = queue.moveToDeadLetter(entry.eventId(), "retry_exhausted_" + reason);
+            if (moved) {
+                logger.error("Activity retry limit reached; event moved to dead-letter: eventId={}", entry.eventId());
+            } else {
+                logger.error("Activity retry limit reached but dead-letter persistence failed; event retained: eventId={}",
+                        entry.eventId());
+            }
             return;
         }
         long nextAttemptAt = now().toEpochMilli() + retryDelayMillis(nextAttempt);
-        queue.markRetry(entry.eventId(), nextAttemptAt);
+        if (!queue.markRetry(entry.eventId(), nextAttemptAt)) {
+            logger.warn("Activity retry state could not be persisted; original event remains active: eventId={}",
+                    entry.eventId());
+        }
     }
 
     private static boolean isRetryableStatus(int statusCode) {
