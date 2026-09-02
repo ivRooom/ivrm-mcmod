@@ -188,6 +188,7 @@ public final class DurableActivityQueue {
 
         List<String> lines;
         try {
+            repairTrailingRecordBoundary(queuePath);
             lines = Files.readAllLines(queuePath, StandardCharsets.UTF_8);
         } catch (IOException exception) {
             quarantineUnreadableQueue(exception);
@@ -260,6 +261,38 @@ public final class DurableActivityQueue {
         }
     }
 
+    /**
+     * A process crash can leave a fully written JSON record without its trailing
+     * newline. Such a record is recoverable, but appendForced intentionally
+     * refuses a non-newline EOF. Repair only the record boundary before parsing;
+     * malformed content is still quarantined by the normal restore path.
+     */
+    private void repairTrailingRecordBoundary(Path path) throws IOException {
+        long size = Files.size(path);
+        if (size == 0L) {
+            return;
+        }
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            ByteBuffer lastByte = ByteBuffer.allocate(1);
+            channel.position(size - 1);
+            if (channel.read(lastByte) != 1) {
+                throw new IOException("Could not inspect Activity journal trailing record boundary");
+            }
+            lastByte.flip();
+            if (lastByte.get() == (byte) '\n') {
+                return;
+            }
+
+            ByteBuffer newline = ByteBuffer.wrap(System.lineSeparator().getBytes(StandardCharsets.UTF_8));
+            channel.position(size);
+            while (newline.hasRemaining()) {
+                channel.write(newline);
+            }
+            channel.force(true);
+            diagnostic.accept("Repaired an unterminated Activity queue tail before restore");
+        }
+    }
+
     private void quarantineUnreadableQueue(IOException cause) {
         Path quarantine = queuePath.resolveSibling(
                 queuePath.getFileName() + ".unreadable-" + System.currentTimeMillis());
@@ -315,11 +348,10 @@ public final class DurableActivityQueue {
             try (FileChannel channel = FileChannel.open(temp, StandardOpenOption.WRITE)) {
                 channel.force(true);
             }
-            try {
-                Files.move(temp, queuePath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException ignored) {
-                Files.move(temp, queuePath, StandardCopyOption.REPLACE_EXISTING);
-            }
+            // Never replace the authoritative journal with a non-atomic move.
+            // If the filesystem cannot provide ATOMIC_MOVE, leave queue.ndjson
+            // untouched and treat compaction as failed/retryable.
+            Files.move(temp, queuePath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
             forceParentDirectory(queuePath);
             mutationsSinceCompaction = 0;
             return true;
