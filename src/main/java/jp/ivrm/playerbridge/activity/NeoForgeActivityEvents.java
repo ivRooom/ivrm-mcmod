@@ -10,7 +10,7 @@ import net.neoforged.bus.api.EventPriority;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerXpEvent;
-import net.neoforged.neoforge.event.server.ServerStoppingEvent;
+import net.neoforged.neoforge.event.server.ServerStoppedEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 
 /** Thin NeoForge adapter around the loader-independent Activity runtime. */
@@ -97,7 +97,10 @@ public final class NeoForgeActivityEvents {
     }
 
     @SubscribeEvent
-    public void onServerStopping(ServerStoppingEvent event) {
+    public void onServerStopped(ServerStoppedEvent event) {
+        // Keep the dispatcher alive through the final PlayerLoggedOutEvent events.
+        // close() performs one last persistence/drain pass before termination.
+        runtime.flushAsync();
         runtime.close();
         players.clear();
     }
