@@ -138,6 +138,32 @@ final class DurableActivityQueueTest {
     }
 
     @Test
+    void repairsValidUnterminatedTailBeforeRestore() throws Exception {
+        Paths paths = paths();
+        DurableActivityQueue original = queue(paths, 10);
+        assertEquals(
+                DurableActivityQueue.EnqueueResult.ACTIVE,
+                original.enqueue("one", "{\"value\":1}", Instant.parse("2026-09-02T00:00:00Z")));
+
+        String journal = Files.readString(paths.queue, StandardCharsets.UTF_8);
+        String lineSeparator = System.lineSeparator();
+        assertTrue(journal.endsWith(lineSeparator));
+        Files.writeString(
+                paths.queue,
+                journal.substring(0, journal.length() - lineSeparator.length()),
+                StandardCharsets.UTF_8);
+
+        DurableActivityQueue restored = queue(paths, 10);
+        assertEquals(1, restored.size());
+        assertEquals("one", restored.nextDue(Long.MAX_VALUE).orElseThrow().eventId());
+        assertTrue(Files.readString(paths.queue, StandardCharsets.UTF_8).endsWith(lineSeparator));
+        assertTrue(restored.markSuccess("one"));
+
+        DurableActivityQueue afterAck = queue(paths, 10);
+        assertEquals(0, afterAck.size());
+    }
+
+    @Test
     void retainsActiveEntryWhenDeadLetterPersistenceFails() throws Exception {
         Paths paths = paths();
         DurableActivityQueue queue = queue(paths, 10);
