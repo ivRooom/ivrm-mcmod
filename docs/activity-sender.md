@@ -87,9 +87,11 @@ config/ivrm/activity/queue.ndjson.unreadable-<timestamp>   # only after whole-fi
 ```
 
 - `queue.ndjson`: append-only active/retry/ack journal. Exact event body is retained across restart. Success/retry state is appended as a small record instead of rewriting the full backlog for every delivery. The dispatcher periodically compacts the journal using temp-file + fsync + atomic replace.
-- Each journal append records the original file boundary. If a write or fsync fails after a partial record, the file is truncated back to that boundary before failure is returned, preventing a later record from being concatenated onto a partial JSON prefix.
+- New durable journal files are fsynced and, on the Linux production target, their parent directory is fsynced before the append is reported as durable. This protects the first queue/dead-letter file creation from disappearing after a power loss even when file contents themselves were flushed.
+- Each journal append records the original file boundary. If a write or fsync fails after a partial record, the file is truncated back to that boundary before failure is returned. Before every later append, the existing non-empty journal must end at a newline record boundary; an incomplete EOF is refused rather than extended with another record.
 - `dead-letter.ndjson`: queue overflow, retry exhaustion, 409 conflict, and permanent receiver failures. An active event is removed only after dead-letter persistence and its queue tombstone both succeed.
-- During restore, a valid event that exceeds the configured queue capacity is dead-lettered. If that dead-letter write fails, restore aborts with the original journal intact; the valid event is never mislabeled as corrupt.
+- Restore first replays the complete append-only journal, including later retry records and tombstones. Only after the final active set is known is the current queue capacity applied. This prevents an intermediate prefix from dead-lettering an event that would fit after a later tombstone.
+- If the final restored active set still exceeds capacity, only the actual final overflow is dead-lettered. If any required dead-letter write fails, restore aborts with the original authoritative journal intact; a valid event is never mislabeled as corrupt.
 - `corrupt.ndjson`: malformed individual queue records quarantined during restore.
 - `queue.ndjson.unreadable-*`: exact original queue file isolated when UTF-8 decoding or whole-file reading fails. If the original file cannot be isolated, Activity sender initialization fails closed while Minecraft itself continues to start.
 
