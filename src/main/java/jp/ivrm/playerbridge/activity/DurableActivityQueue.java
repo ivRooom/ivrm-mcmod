@@ -15,6 +15,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.Consumer;
@@ -228,20 +229,29 @@ public final class DurableActivityQueue {
                 continue;
             }
 
-            boolean replacing = restored.containsKey(entry.eventId());
-            if (!replacing && restored.size() >= maxEntries) {
-                if (!appendDeadLetter(entry, "queue_overflow_on_restore")) {
-                    // This is a valid durable record. Never route preservation
-                    // failures through corrupt-record quarantine.
-                    throw new IllegalStateException(
-                            "Failed to preserve overflowed Activity queue record; original journal remains intact");
-                }
-                needsCompaction = true;
-                continue;
-            }
             if (restored.put(entry.eventId(), entry) != null) {
                 needsCompaction = true;
             }
+        }
+
+        // Capacity is a property of the final active set, not of an intermediate
+        // journal prefix. Replay all tombstones/retries first, then preserve only
+        // the actual final overflow in dead-letter storage.
+        if (restored.size() > maxEntries) {
+            List<QueueEntry> active = new ArrayList<>(restored.values());
+            for (int index = maxEntries; index < active.size(); index++) {
+                QueueEntry overflow = active.get(index);
+                if (!appendDeadLetter(overflow, "queue_overflow_on_restore")) {
+                    throw new IllegalStateException(
+                            "Failed to preserve overflowed Activity queue record; original journal remains intact");
+                }
+            }
+            restored.clear();
+            for (int index = 0; index < maxEntries; index++) {
+                QueueEntry retained = active.get(index);
+                restored.put(retained.eventId(), retained);
+            }
+            needsCompaction = true;
         }
 
         entries.addAll(restored.values());
@@ -375,13 +385,19 @@ public final class DurableActivityQueue {
     }
 
     /**
-     * Appends one complete journal record and fsyncs it. If a write or force
-     * fails after a partial record was written, the file is truncated back to
-     * its original boundary before the failure is reported to the caller.
+     * Appends one complete journal record and fsyncs it. New file creation also
+     * fsyncs the parent directory on POSIX so the directory entry is durable.
+     * If a write or force fails after a partial record was written, the file is
+     * truncated back to its original boundary before the failure is reported.
+     * Future appends refuse a non-newline EOF, so a failed rollback cannot be
+     * extended into a second corrupted record.
      */
     private static void appendForced(Path path, String content) throws IOException {
         ensureParent(path);
-        long originalSize = Files.exists(path) ? Files.size(path) : 0L;
+        boolean existed = Files.exists(path);
+        long originalSize = existed ? Files.size(path) : 0L;
+        verifyAppendBoundary(path, originalSize);
+
         ByteBuffer buffer = ByteBuffer.wrap(content.getBytes(StandardCharsets.UTF_8));
         try (FileChannel channel = FileChannel.open(
                 path,
@@ -393,6 +409,9 @@ public final class DurableActivityQueue {
                     channel.write(buffer);
                 }
                 channel.force(true);
+                if (!existed) {
+                    forceParentDirectory(path);
+                }
             } catch (IOException appendFailure) {
                 try {
                     channel.truncate(originalSize);
@@ -403,6 +422,47 @@ public final class DurableActivityQueue {
                 throw appendFailure;
             }
         }
+    }
+
+    private static void verifyAppendBoundary(Path path, long size) throws IOException {
+        if (size == 0L) {
+            return;
+        }
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
+            ByteBuffer lastByte = ByteBuffer.allocate(1);
+            channel.position(size - 1);
+            if (channel.read(lastByte) != 1) {
+                throw new IOException("Could not verify Activity journal record boundary");
+            }
+            lastByte.flip();
+            if (lastByte.get() != (byte) '\n') {
+                throw new IOException("Activity journal has an incomplete trailing record; refusing append");
+            }
+        }
+    }
+
+    private static void forceParentDirectory(Path path) throws IOException {
+        Path parent = path.getParent();
+        if (parent == null) {
+            return;
+        }
+        try (FileChannel directory = FileChannel.open(parent, StandardOpenOption.READ)) {
+            directory.force(true);
+        } catch (UnsupportedOperationException | IOException exception) {
+            // Java/Windows commonly cannot open a directory as FileChannel.
+            // Production Minecraft runs on Linux, where parent fsync is part of
+            // the durability guarantee. Keep local Windows development usable.
+            if (!isWindows()) {
+                if (exception instanceof IOException ioException) {
+                    throw ioException;
+                }
+                throw new IOException("Could not fsync Activity journal parent directory", exception);
+            }
+        }
+    }
+
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
     }
 
     private static void ensureParent(Path path) throws IOException {
