@@ -269,6 +269,7 @@ public final class DurableActivityQueue {
             } catch (AtomicMoveNotSupportedException ignored) {
                 Files.move(queuePath, quarantine);
             }
+            forceParentDirectory(queuePath);
             diagnostic.accept("Unreadable Activity queue was isolated intact before sender startup");
         } catch (IOException moveFailure) {
             IllegalStateException failure = new IllegalStateException(
@@ -291,7 +292,9 @@ public final class DurableActivityQueue {
     private boolean compactQueue() {
         try {
             if (entries.isEmpty()) {
-                Files.deleteIfExists(queuePath);
+                if (Files.deleteIfExists(queuePath)) {
+                    forceParentDirectory(queuePath);
+                }
                 mutationsSinceCompaction = 0;
                 return true;
             }
@@ -317,6 +320,7 @@ public final class DurableActivityQueue {
             } catch (AtomicMoveNotSupportedException ignored) {
                 Files.move(temp, queuePath, StandardCopyOption.REPLACE_EXISTING);
             }
+            forceParentDirectory(queuePath);
             mutationsSinceCompaction = 0;
             return true;
         } catch (IOException exception) {
@@ -467,8 +471,20 @@ public final class DurableActivityQueue {
 
     private static void ensureParent(Path path) throws IOException {
         Path parent = path.getParent();
-        if (parent != null) {
-            Files.createDirectories(parent);
+        if (parent == null || Files.exists(parent)) {
+            return;
+        }
+
+        List<Path> missingDirectories = new ArrayList<>();
+        Path current = parent;
+        while (current != null && !Files.exists(current)) {
+            missingDirectories.add(current);
+            current = current.getParent();
+        }
+
+        Files.createDirectories(parent);
+        for (int index = missingDirectories.size() - 1; index >= 0; index--) {
+            forceParentDirectory(missingDirectories.get(index));
         }
     }
 }
