@@ -20,7 +20,7 @@ NeoForge gameplay event
 
 The gameplay thread performs no filesystem or HTTP I/O during normal operation. The dispatcher must durably fsync an event before its first network attempt.
 
-There is intentionally a small crash window between a successful in-memory ingress offer and the dispatcher's first fsync. This trade-off prevents disk latency from blocking Minecraft ticks. During an orderly `ServerStoppedEvent`, shutdown changes priorities: remaining accepted ingress is synchronously fsynced to the durable journal **before** the dispatcher is interrupted or any in-flight network request is awaited. Once ingress is durable, network delivery may stop immediately and resume from the journal after restart.
+There is intentionally a small crash window between a successful in-memory ingress offer and the dispatcher's first fsync. This trade-off prevents disk latency from blocking Minecraft ticks. During an orderly `ServerStoppedEvent`, shutdown changes priorities: `close()` first atomically closes the ingress gate, then synchronously fsyncs every event accepted before that gate to the durable journal **before** the dispatcher is interrupted or any in-flight network request is awaited. Events emitted after shutdown begins are rejected rather than accepted into an unflushable race window.
 
 If the process or host loses power before the first fsync, only events that still existed solely in the bounded in-memory ingress can be lost. If the in-memory ingress itself is full, a new event is rejected rather than blocking the Minecraft tick; the condition is logged and must be treated as an operational capacity incident.
 
@@ -86,14 +86,15 @@ config/ivrm/activity/corrupt.ndjson
 config/ivrm/activity/queue.ndjson.unreadable-<timestamp>   # only after whole-file decode failure
 ```
 
-- `queue.ndjson`: append-only active/retry/ack journal. Exact event body is retained across restart. Success/retry state is appended as a small record instead of rewriting the full backlog for every delivery. The dispatcher periodically compacts the journal using temp-file + fsync + atomic replace.
-- New durable journal files are fsynced and, on the Linux production target, their parent directory is fsynced before the append is reported as durable. This protects the first queue/dead-letter file creation from disappearing after a power loss even when file contents themselves were flushed.
+- `queue.ndjson`: append-only active/retry/ack journal. Exact event body is retained across restart. Success/retry state is appended as a small record instead of rewriting the full backlog for every delivery. The dispatcher periodically compacts the journal using temp-file + fsync + atomic replace, then fsyncs the parent directory before reporting compaction success.
+- The first non-empty record of a durable journal fsyncs the file and, on the Linux production target, the full ancestor-directory chain before the append is reported as durable. If an initial directory/file durability step fails, the record is rolled back to its prior boundary. A retry against a zero-length first journal repeats the ancestor fsync, so directories or a file left by the failed first attempt cannot silently skip the durability barrier.
 - Each journal append records the original file boundary. If a write or fsync fails after a partial record, the file is truncated back to that boundary before failure is returned. Before every later append, the existing non-empty journal must end at a newline record boundary; an incomplete EOF is refused rather than extended with another record.
 - `dead-letter.ndjson`: queue overflow, retry exhaustion, 409 conflict, and permanent receiver failures. An active event is removed only after dead-letter persistence and its queue tombstone both succeed.
 - Restore first replays the complete append-only journal, including later retry records and tombstones. Only after the final active set is known is the current queue capacity applied. This prevents an intermediate prefix from dead-lettering an event that would fit after a later tombstone.
 - If the final restored active set still exceeds capacity, only the actual final overflow is dead-lettered. If any required dead-letter write fails, restore aborts with the original authoritative journal intact; a valid event is never mislabeled as corrupt.
 - `corrupt.ndjson`: malformed individual queue records quarantined during restore.
 - `queue.ndjson.unreadable-*`: exact original queue file isolated when UTF-8 decoding or whole-file reading fails. If the original file cannot be isolated, Activity sender initialization fails closed while Minecraft itself continues to start.
+- If new ingress cannot be persisted because the active durable queue is full and the dead-letter path is unavailable, that ingress head remains in memory for retry. The dispatcher still drains already-durable events; successful delivery can free queue capacity so the retained ingress can become durable on a later cycle. A dead-letter failure therefore does not deadlock the entire sender.
 
 Do not delete these files during incident response unless the retained events have been deliberately reconciled.
 
@@ -102,7 +103,10 @@ Do not delete these files during incident response unless the retained events ha
 - `eventId` and body `occurredAt` are generated at the gameplay event and remain unchanged.
 - Every HTTP attempt generates a fresh `X-IVRM-Timestamp`.
 - HMAC is recomputed for every attempt using the unchanged body and event ID.
-- HTTP `200` and `202` append an acknowledgement tombstone before removing the active in-memory entry. If that journal write fails, the event remains active and may be replayed safely.
+- HTTP `202` is accepted only when the response body is valid JSON with `status=accepted`, the same `eventId`, and `replayed=false`.
+- HTTP `200` replay acknowledgement is accepted only with `status=accepted`, the same `eventId`, and `replayed=true`.
+- Malformed, mismatched, or status-inconsistent `200/202` acknowledgements do **not** tombstone the event; the event remains retryable.
+- A valid `200/202` acknowledgement appends a queue tombstone before removing the active in-memory entry. If that journal write fails, the event remains active and may be replayed safely.
 - HTTP `409` moves the event to dead-letter for investigation. If dead-letter persistence fails, the active copy is retained.
 - HTTP `408`, `425`, `429`, and `5xx` use exponential backoff with jitter. Retry state is journaled before the in-memory schedule changes.
 - Other `4xx` responses are treated as permanent and moved to dead-letter.
@@ -117,7 +121,7 @@ Do not delete these files during incident response unless the retained events ha
 - `player.afk_changed`: emitted only when sampled AFK state changes
 - `player.stat_delta`: NeoForge XP change represented as `stat=minecraft:experience_points`, `delta=<amount>`
 
-The dispatcher remains active through final `PlayerLoggedOutEvent` handling. `ServerStoppedEvent` calls `ActivityRuntime.close()`, which first executes the synchronous ingress durability barrier and only then interrupts/terminates the dispatcher. Shutdown does not wait for a potentially long HTTP request before making accepted ingress durable.
+The dispatcher remains active through final `PlayerLoggedOutEvent` handling. `ServerStoppedEvent` calls `ActivityRuntime.close()`, which closes new ingress, executes the synchronous ingress durability barrier, and only then interrupts/terminates the dispatcher. Shutdown does not wait for a potentially long HTTP request before making already-accepted ingress durable.
 
 All event-specific metadata is string-only `attributes`. Credentials and player chat must never be placed in attributes.
 
