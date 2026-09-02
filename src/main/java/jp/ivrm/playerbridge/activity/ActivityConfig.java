@@ -127,10 +127,11 @@ public final class ActivityConfig {
         if ("https".equalsIgnoreCase(scheme)) {
             return;
         }
+        String host = baseUri.getHost();
         boolean localHttp = "http".equalsIgnoreCase(scheme)
-                && ("localhost".equalsIgnoreCase(baseUri.getHost())
-                        || "127.0.0.1".equals(baseUri.getHost())
-                        || "::1".equals(baseUri.getHost()));
+                && ("localhost".equalsIgnoreCase(host)
+                        || "127.0.0.1".equals(host)
+                        || "[::1]".equals(host));
         if (!localHttp) {
             throw new IllegalArgumentException("Activity API requires HTTPS except for localhost development");
         }
