@@ -199,33 +199,47 @@ public final class DurableActivityQueue {
             if (line.isBlank()) {
                 continue;
             }
-            try {
-                JsonObject object = JsonParser.parseString(line).getAsJsonObject();
-                String eventId = object.get("eventId").getAsString();
-                if (object.has("removed") && object.get("removed").getAsBoolean()) {
-                    restored.remove(eventId);
-                    needsCompaction = true;
-                    continue;
-                }
 
-                QueueEntry entry = parse(object);
-                boolean replacing = restored.containsKey(entry.eventId());
-                if (!replacing && restored.size() >= maxEntries) {
-                    if (!appendDeadLetter(entry, "queue_overflow_on_restore")) {
-                        throw new IllegalStateException("Failed to preserve overflowed Activity queue record");
-                    }
-                    needsCompaction = true;
-                    continue;
+            JsonObject object;
+            String eventId;
+            QueueEntry entry = null;
+            boolean removed;
+            try {
+                object = JsonParser.parseString(line).getAsJsonObject();
+                eventId = object.get("eventId").getAsString();
+                removed = object.has("removed") && object.get("removed").getAsBoolean();
+                if (!removed) {
+                    entry = parse(object);
                 }
-                if (restored.put(entry.eventId(), entry) != null) {
-                    needsCompaction = true;
-                }
-            } catch (RuntimeException exception) {
+            } catch (RuntimeException parseFailure) {
                 if (!quarantineCorruptLine(line, "invalid_queue_record")) {
                     throw new IllegalStateException(
-                            "Activity queue contains a malformed record that could not be quarantined");
+                            "Activity queue contains a malformed record that could not be quarantined",
+                            parseFailure);
                 }
                 diagnostic.accept("Quarantined one malformed Activity queue record");
+                needsCompaction = true;
+                continue;
+            }
+
+            if (removed) {
+                restored.remove(eventId);
+                needsCompaction = true;
+                continue;
+            }
+
+            boolean replacing = restored.containsKey(entry.eventId());
+            if (!replacing && restored.size() >= maxEntries) {
+                if (!appendDeadLetter(entry, "queue_overflow_on_restore")) {
+                    // This is a valid durable record. Never route preservation
+                    // failures through corrupt-record quarantine.
+                    throw new IllegalStateException(
+                            "Failed to preserve overflowed Activity queue record; original journal remains intact");
+                }
+                needsCompaction = true;
+                continue;
+            }
+            if (restored.put(entry.eventId(), entry) != null) {
                 needsCompaction = true;
             }
         }
@@ -360,18 +374,34 @@ public final class DurableActivityQueue {
                 object.get("queuedAt").getAsString());
     }
 
+    /**
+     * Appends one complete journal record and fsyncs it. If a write or force
+     * fails after a partial record was written, the file is truncated back to
+     * its original boundary before the failure is reported to the caller.
+     */
     private static void appendForced(Path path, String content) throws IOException {
         ensureParent(path);
+        long originalSize = Files.exists(path) ? Files.size(path) : 0L;
         ByteBuffer buffer = ByteBuffer.wrap(content.getBytes(StandardCharsets.UTF_8));
         try (FileChannel channel = FileChannel.open(
                 path,
                 StandardOpenOption.CREATE,
-                StandardOpenOption.WRITE,
-                StandardOpenOption.APPEND)) {
-            while (buffer.hasRemaining()) {
-                channel.write(buffer);
+                StandardOpenOption.WRITE)) {
+            channel.position(originalSize);
+            try {
+                while (buffer.hasRemaining()) {
+                    channel.write(buffer);
+                }
+                channel.force(true);
+            } catch (IOException appendFailure) {
+                try {
+                    channel.truncate(originalSize);
+                    channel.force(true);
+                } catch (IOException rollbackFailure) {
+                    appendFailure.addSuppressed(rollbackFailure);
+                }
+                throw appendFailure;
             }
-            channel.force(true);
         }
     }
 
