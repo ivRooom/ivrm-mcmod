@@ -122,13 +122,36 @@ public final class ActivityRuntime implements AutoCloseable {
             if (!persistIngress()) {
                 return;
             }
-            for (int count = 0; count < MAX_DRAIN_PER_CYCLE; count++) {
-                if (!drainOne()) {
-                    break;
-                }
-            }
+            drainNetworkBatch();
         } catch (RuntimeException exception) {
             logger.error("Unexpected Activity dispatcher failure; queued state is retained", exception);
+        }
+    }
+
+    /**
+     * Final orderly-shutdown pass. Persist every currently accepted ingress
+     * event before terminating the dispatcher, then attempt one bounded network
+     * drain. If persistence becomes unavailable, the remaining ingress count is
+     * reported rather than blocking server shutdown indefinitely.
+     */
+    private void safeFinalDrain() {
+        try {
+            while (!ingress.isEmpty()) {
+                if (!persistIngress()) {
+                    return;
+                }
+            }
+            drainNetworkBatch();
+        } catch (RuntimeException exception) {
+            logger.error("Unexpected final Activity flush failure; queued state is retained where durable", exception);
+        }
+    }
+
+    private void drainNetworkBatch() {
+        for (int count = 0; count < MAX_DRAIN_PER_CYCLE; count++) {
+            if (!drainOne()) {
+                break;
+            }
         }
     }
 
@@ -241,7 +264,10 @@ public final class ActivityRuntime implements AutoCloseable {
 
     @Override
     public void close() {
-        dispatcher.shutdown();
+        if (!dispatcher.isShutdown()) {
+            dispatcher.execute(this::safeFinalDrain);
+            dispatcher.shutdown();
+        }
         try {
             if (!dispatcher.awaitTermination(5, TimeUnit.SECONDS)) {
                 dispatcher.shutdownNow();
