@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.URI;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -54,15 +53,16 @@ final class ActivityRuntimeTest {
 
         runtime.close();
 
-        String journal = Files.readString(config.queuePath(), StandardCharsets.UTF_8);
-        assertTrue(journal.contains("\"type\":\"player.logout\""));
-        assertTrue(journal.contains("\"playerName\":\"PlayerOne\""));
-        assertEquals(1, new DurableActivityQueue(
-                        config.queuePath(),
-                        config.deadLetterPath(),
-                        config.corruptPath(),
-                        config.maxQueueEntries(),
-                        ignored -> {})
-                .size());
+        assertTrue(Files.exists(config.queuePath()));
+        DurableActivityQueue restored = new DurableActivityQueue(
+                config.queuePath(),
+                config.deadLetterPath(),
+                config.corruptPath(),
+                config.maxQueueEntries(),
+                ignored -> {});
+        assertEquals(1, restored.size());
+        String body = restored.nextDue(Long.MAX_VALUE).orElseThrow().body();
+        assertTrue(body.contains("\"type\":\"player.logout\""));
+        assertTrue(body.contains("\"playerName\":\"PlayerOne\""));
     }
 }
