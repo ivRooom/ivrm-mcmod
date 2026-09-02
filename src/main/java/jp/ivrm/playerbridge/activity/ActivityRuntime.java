@@ -15,8 +15,10 @@ import org.slf4j.Logger;
 
 /**
  * Owns the bounded ingress, durable journal and background dispatcher.
- * Gameplay threads only serialize and offer events to memory; all filesystem
- * and HTTP I/O runs on the dispatcher thread.
+ * Gameplay threads only serialize and offer events to memory; normal filesystem
+ * and HTTP I/O runs on the dispatcher thread. Orderly shutdown is the sole
+ * exception: it synchronously persists remaining ingress before interrupting
+ * any in-flight network work.
  */
 public final class ActivityRuntime implements AutoCloseable {
     private static final int MAX_PERSIST_PER_CYCLE = 100;
@@ -30,6 +32,7 @@ public final class ActivityRuntime implements AutoCloseable {
     private final Clock clock;
     private final AtomicLong sequence = new AtomicLong();
     private final ArrayBlockingQueue<PendingEvent> ingress;
+    private final Object persistenceLock = new Object();
     private final DurableActivityQueue queue;
     private final ActivityHttpClient httpClient;
     private final ScheduledExecutorService dispatcher;
@@ -110,40 +113,14 @@ public final class ActivityRuntime implements AutoCloseable {
         }
     }
 
-    /** Schedules an immediate background persistence/drain without blocking the caller. */
-    public void flushAsync() {
-        if (enabled() && !dispatcher.isShutdown()) {
-            dispatcher.execute(this::safeDrain);
-        }
-    }
-
     private void safeDrain() {
         try {
-            if (!persistIngress()) {
+            if (!persistIngressBatch()) {
                 return;
             }
             drainNetworkBatch();
         } catch (RuntimeException exception) {
             logger.error("Unexpected Activity dispatcher failure; queued state is retained", exception);
-        }
-    }
-
-    /**
-     * Final orderly-shutdown pass. Persist every currently accepted ingress
-     * event before terminating the dispatcher, then attempt one bounded network
-     * drain. If persistence becomes unavailable, the remaining ingress count is
-     * reported rather than blocking server shutdown indefinitely.
-     */
-    private void safeFinalDrain() {
-        try {
-            while (!ingress.isEmpty()) {
-                if (!persistIngress()) {
-                    return;
-                }
-            }
-            drainNetworkBatch();
-        } catch (RuntimeException exception) {
-            logger.error("Unexpected final Activity flush failure; queued state is retained where durable", exception);
         }
     }
 
@@ -156,11 +133,17 @@ public final class ActivityRuntime implements AutoCloseable {
     }
 
     /**
-     * Moves ingress events to the fsynced journal before any network attempt.
-     * The head remains in memory when neither the active journal nor the
-     * dead-letter journal can be persisted.
+     * Moves one bounded batch of ingress events to the fsynced journal before
+     * any network attempt. Persistence is serialized with the shutdown flush so
+     * both paths can safely inspect/poll the same ingress head.
      */
-    private boolean persistIngress() {
+    private boolean persistIngressBatch() {
+        synchronized (persistenceLock) {
+            return persistIngressBatchLocked();
+        }
+    }
+
+    private boolean persistIngressBatchLocked() {
         for (int count = 0; count < MAX_PERSIST_PER_CYCLE; count++) {
             PendingEvent pending = ingress.peek();
             if (pending == null) {
@@ -183,6 +166,22 @@ public final class ActivityRuntime implements AutoCloseable {
             }
         }
         return true;
+    }
+
+    /**
+     * Orderly shutdown durability barrier. This method performs no HTTP work and
+     * runs before the dispatcher is interrupted, so an in-flight request cannot
+     * prevent accepted ingress from reaching durable storage.
+     */
+    private boolean persistAllIngressForShutdown() {
+        synchronized (persistenceLock) {
+            while (!ingress.isEmpty()) {
+                if (!persistIngressBatchLocked()) {
+                    return false;
+                }
+            }
+            return true;
+        }
     }
 
     boolean drainOne() {
@@ -264,17 +263,23 @@ public final class ActivityRuntime implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!dispatcher.isShutdown()) {
-            dispatcher.execute(this::safeFinalDrain);
-            dispatcher.shutdown();
+        boolean persisted = false;
+        try {
+            persisted = persistAllIngressForShutdown();
+        } catch (RuntimeException exception) {
+            logger.error("Final Activity ingress persistence failed; accepted in-memory events may remain only in RAM", exception);
         }
+        if (!persisted && !ingress.isEmpty()) {
+            logger.error("Activity sender shutdown with {} ingress event(s) not yet durable", ingress.size());
+        }
+
+        dispatcher.shutdownNow();
         try {
             if (!dispatcher.awaitTermination(5, TimeUnit.SECONDS)) {
-                dispatcher.shutdownNow();
+                logger.warn("Activity dispatcher did not terminate within shutdown grace period; durable queue is preserved");
             }
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            dispatcher.shutdownNow();
         }
         logger.info("IVRM Activity sender stopped with queuedEvents={}", queuedEvents());
     }
