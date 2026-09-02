@@ -4,20 +4,23 @@ This document covers the NeoForge producer for the canonical Minecraft Activity 
 
 ## Safety model
 
-The sender is **disabled by default**. Activity reporting must never make Minecraft gameplay depend on API availability.
+The sender is **disabled by default**. Activity reporting must never make Minecraft gameplay depend on API or disk latency.
 
 Event flow:
 
 ```text
 NeoForge gameplay event
   -> canonical Activity Event v1 JSON
-  -> durable local queue (fsync)
+  -> bounded in-memory ingress (non-blocking offer)
   -> background dispatcher
+  -> append-only durable queue journal (fsync)
   -> fresh X-IVRM-Timestamp + fresh HMAC-SHA256
   -> POST /v1/minecraft/activity-events
 ```
 
-The gameplay thread only appends to the local queue. It does not wait for HTTP.
+The gameplay thread performs no filesystem or HTTP I/O. The dispatcher must durably fsync an event before its first network attempt.
+
+There is intentionally a small crash window between a successful in-memory ingress offer and the dispatcher's first fsync. This trade-off prevents disk latency from blocking Minecraft ticks. An orderly `ServerStoppedEvent` performs a final ingress persistence/drain pass before the dispatcher terminates. If the process or host loses power before that pass, only events that had not yet reached `queue.ndjson` can be lost.
 
 ## Canonical contract pin
 
@@ -68,7 +71,7 @@ Optional tuning:
 
 Equivalent JVM properties use the `ivrm.activity.*` names implemented by `ActivityConfig`.
 
-HTTP is accepted only for localhost development. Remote Activity API endpoints require HTTPS.
+HTTP is accepted only for localhost development (`localhost`, `127.0.0.1`, `[::1]`). Remote Activity API endpoints require HTTPS. Embedded credentials, query strings, fragments, and non-root base paths are rejected.
 
 ## Durable state
 
@@ -78,11 +81,13 @@ Under the Minecraft game directory:
 config/ivrm/activity/queue.ndjson
 config/ivrm/activity/dead-letter.ndjson
 config/ivrm/activity/corrupt.ndjson
+config/ivrm/activity/queue.ndjson.unreadable-<timestamp>   # only after whole-file decode failure
 ```
 
-- `queue.ndjson`: active retry queue. Exact event body is retained across restart.
-- `dead-letter.ndjson`: queue overflow, retry exhaustion, 409 conflict, and permanent receiver failures. Events are isolated, not silently deleted.
-- `corrupt.ndjson`: malformed queue records quarantined during restore. Queue corruption does not block server startup.
+- `queue.ndjson`: append-only active/retry/ack journal. Exact event body is retained across restart. Success/retry state is appended as a small record instead of rewriting the full backlog for every delivery. The dispatcher periodically compacts the journal using temp-file + fsync + atomic replace.
+- `dead-letter.ndjson`: queue overflow, retry exhaustion, 409 conflict, and permanent receiver failures. An active event is removed only after dead-letter persistence and its queue tombstone both succeed.
+- `corrupt.ndjson`: malformed individual queue records quarantined during restore.
+- `queue.ndjson.unreadable-*`: exact original queue file isolated when UTF-8 decoding or whole-file reading fails. If the original file cannot be isolated, Activity sender initialization fails closed while Minecraft itself continues to start.
 
 Do not delete these files during incident response unless the retained events have been deliberately reconciled.
 
@@ -91,11 +96,12 @@ Do not delete these files during incident response unless the retained events ha
 - `eventId` and body `occurredAt` are generated at the gameplay event and remain unchanged.
 - Every HTTP attempt generates a fresh `X-IVRM-Timestamp`.
 - HMAC is recomputed for every attempt using the unchanged body and event ID.
-- HTTP `200` and `202` remove the queued event.
-- HTTP `409` moves the event to dead-letter for investigation.
-- HTTP `408`, `425`, `429`, and `5xx` use exponential backoff with jitter.
+- HTTP `200` and `202` append an acknowledgement tombstone before removing the active in-memory entry. If that journal write fails, the event remains active and may be replayed safely.
+- HTTP `409` moves the event to dead-letter for investigation. If dead-letter persistence fails, the active copy is retained.
+- HTTP `408`, `425`, `429`, and `5xx` use exponential backoff with jitter. Retry state is journaled before the in-memory schedule changes.
 - Other `4xx` responses are treated as permanent and moved to dead-letter.
 - Retry exhaustion moves the event to dead-letter instead of dropping it.
+- The receiver's event-id idempotency is required because preserving data on local persistence failures can intentionally cause a replay rather than a loss.
 
 ## Canonical event sources
 
@@ -104,6 +110,8 @@ Do not delete these files during incident response unless the retained events ha
 - `player.heartbeat`: periodic online-player heartbeat
 - `player.afk_changed`: emitted only when sampled AFK state changes
 - `player.stat_delta`: NeoForge XP change represented as `stat=minecraft:experience_points`, `delta=<amount>`
+
+The dispatcher remains active through final `PlayerLoggedOutEvent` handling and is closed from `ServerStoppedEvent`.
 
 All event-specific metadata is string-only `attributes`. Credentials and player chat must never be placed in attributes.
 
@@ -119,13 +127,13 @@ Required order:
 4. Complete reviewed persistence migration and receiver deployment.
 5. Provision each server secret out-of-band with least privilege.
 6. Start with `IVRM_ACTIVITY_ENABLED=false` and verify server startup.
-7. Enable one non-critical server first and verify 200/202 ingestion, queue drain, and no TPS impact.
+7. Enable one non-critical server first and verify 200/202 ingestion, queue drain, bounded ingress behavior, and no material TPS regression.
 8. Enable remaining servers gradually.
 
 ## Rollback
 
 1. Set `IVRM_ACTIVITY_ENABLED=false` and restart the affected Minecraft server.
-2. Preserve `queue.ndjson`, `dead-letter.ndjson`, and accepted receiver records.
+2. Preserve `queue.ndjson`, `dead-letter.ndjson`, `corrupt.ndjson`, any `queue.ndjson.unreadable-*` file, and accepted receiver records.
 3. Stop downstream canonical processing separately if the fault is after durable ingest.
 4. Fix/redeploy the receiver or producer.
 5. Re-enable only after Contract / Consumer / Producer conformance is restored.
