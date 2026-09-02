@@ -18,9 +18,11 @@ NeoForge gameplay event
   -> POST /v1/minecraft/activity-events
 ```
 
-The gameplay thread performs no filesystem or HTTP I/O. The dispatcher must durably fsync an event before its first network attempt.
+The gameplay thread performs no filesystem or HTTP I/O during normal operation. The dispatcher must durably fsync an event before its first network attempt.
 
-There is intentionally a small crash window between a successful in-memory ingress offer and the dispatcher's first fsync. This trade-off prevents disk latency from blocking Minecraft ticks. An orderly `ServerStoppedEvent` performs a final ingress persistence/drain pass before the dispatcher terminates. If the process or host loses power before that pass, only events that had not yet reached `queue.ndjson` can be lost.
+There is intentionally a small crash window between a successful in-memory ingress offer and the dispatcher's first fsync. This trade-off prevents disk latency from blocking Minecraft ticks. During an orderly `ServerStoppedEvent`, shutdown changes priorities: remaining accepted ingress is synchronously fsynced to the durable journal **before** the dispatcher is interrupted or any in-flight network request is awaited. Once ingress is durable, network delivery may stop immediately and resume from the journal after restart.
+
+If the process or host loses power before the first fsync, only events that still existed solely in the bounded in-memory ingress can be lost. If the in-memory ingress itself is full, a new event is rejected rather than blocking the Minecraft tick; the condition is logged and must be treated as an operational capacity incident.
 
 ## Canonical contract pin
 
@@ -85,7 +87,9 @@ config/ivrm/activity/queue.ndjson.unreadable-<timestamp>   # only after whole-fi
 ```
 
 - `queue.ndjson`: append-only active/retry/ack journal. Exact event body is retained across restart. Success/retry state is appended as a small record instead of rewriting the full backlog for every delivery. The dispatcher periodically compacts the journal using temp-file + fsync + atomic replace.
+- Each journal append records the original file boundary. If a write or fsync fails after a partial record, the file is truncated back to that boundary before failure is returned, preventing a later record from being concatenated onto a partial JSON prefix.
 - `dead-letter.ndjson`: queue overflow, retry exhaustion, 409 conflict, and permanent receiver failures. An active event is removed only after dead-letter persistence and its queue tombstone both succeed.
+- During restore, a valid event that exceeds the configured queue capacity is dead-lettered. If that dead-letter write fails, restore aborts with the original journal intact; the valid event is never mislabeled as corrupt.
 - `corrupt.ndjson`: malformed individual queue records quarantined during restore.
 - `queue.ndjson.unreadable-*`: exact original queue file isolated when UTF-8 decoding or whole-file reading fails. If the original file cannot be isolated, Activity sender initialization fails closed while Minecraft itself continues to start.
 
@@ -111,7 +115,7 @@ Do not delete these files during incident response unless the retained events ha
 - `player.afk_changed`: emitted only when sampled AFK state changes
 - `player.stat_delta`: NeoForge XP change represented as `stat=minecraft:experience_points`, `delta=<amount>`
 
-The dispatcher remains active through final `PlayerLoggedOutEvent` handling and is closed from `ServerStoppedEvent`.
+The dispatcher remains active through final `PlayerLoggedOutEvent` handling. `ServerStoppedEvent` calls `ActivityRuntime.close()`, which first executes the synchronous ingress durability barrier and only then interrupts/terminates the dispatcher. Shutdown does not wait for a potentially long HTTP request before making accepted ingress durable.
 
 All event-specific metadata is string-only `attributes`. Credentials and player chat must never be placed in attributes.
 
