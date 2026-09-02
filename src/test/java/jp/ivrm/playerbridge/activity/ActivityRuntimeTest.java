@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.LoggerFactory;
@@ -180,7 +181,69 @@ final class ActivityRuntimeTest {
         assertEquals(body, retained.body());
     }
 
+    @Test
+    void durableBacklogDrainsEvenWhenIngressCannotBeDeadLetteredAtCapacity() throws Exception {
+        AtomicInteger acceptedRequests = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext(ActivityHttpClient.PATH, exchange -> {
+            String eventId = exchange.getRequestHeaders().getFirst("X-IVRM-Event-Id");
+            byte[] response = ("{\"status\":\"accepted\",\"eventId\":\"" + eventId
+                            + "\",\"replayed\":false}")
+                    .getBytes(StandardCharsets.UTF_8);
+            acceptedRequests.incrementAndGet();
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(202, response.length);
+            exchange.getResponseBody().write(response);
+            exchange.close();
+        });
+        server.start();
+
+        Path state = tempDir.resolve("durable-backlog-progress");
+        ActivityConfig config = config(
+                state,
+                URI.create("http://127.0.0.1:" + server.getAddress().getPort()),
+                1);
+        DurableActivityQueue seed = restore(config);
+        assertEquals(
+                DurableActivityQueue.EnqueueResult.ACTIVE,
+                seed.enqueue(
+                        "018f4b20-8a6f-7a2a-8f4b-1234567890ab",
+                        "{\"eventId\":\"018f4b20-8a6f-7a2a-8f4b-1234567890ab\"}",
+                        Instant.parse("2026-09-02T00:00:00Z")));
+
+        Files.createDirectory(config.deadLetterPath());
+        Clock clock = Clock.fixed(Instant.parse("2026-09-02T00:01:00Z"), ZoneOffset.UTC);
+        ActivityRuntime runtime = new ActivityRuntime(
+                config,
+                LoggerFactory.getLogger(ActivityRuntimeTest.class),
+                clock);
+        try {
+            runtime.emit(
+                    "player.logout",
+                    UUID.fromString("018f4b20-8a6f-7a2a-8f4b-1234567890ac"),
+                    "PlayerTwo",
+                    Map.of());
+            runtime.start();
+
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(6);
+            while (acceptedRequests.get() < 2 && System.nanoTime() < deadline) {
+                Thread.sleep(25);
+            }
+
+            assertEquals(2, acceptedRequests.get(),
+                    "durable backlog must drain so retained ingress can use the freed capacity");
+            assertEquals(0, runtime.queuedEvents());
+        } finally {
+            runtime.close();
+            server.stop(0);
+        }
+    }
+
     private ActivityConfig config(Path state, URI baseUri) {
+        return config(state, baseUri, 100);
+    }
+
+    private ActivityConfig config(Path state, URI baseUri, int maxQueueEntries) {
         return new ActivityConfig(
                 true,
                 baseUri,
@@ -191,7 +254,7 @@ final class ActivityRuntimeTest {
                 Duration.ofSeconds(120),
                 30,
                 300,
-                100,
+                maxQueueEntries,
                 5,
                 state.resolve("queue.ndjson"),
                 state.resolve("dead-letter.ndjson"),
