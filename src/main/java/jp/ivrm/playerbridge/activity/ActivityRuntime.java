@@ -129,9 +129,10 @@ public final class ActivityRuntime implements AutoCloseable {
 
     private void safeDrain() {
         try {
-            if (!persistIngressBatch()) {
-                return;
-            }
+            // A failed ingress persistence attempt must not stall events that
+            // are already durable. Draining the durable backlog can free queue
+            // capacity so the retained ingress head succeeds on a later cycle.
+            persistIngressBatch();
             drainNetworkBatch();
         } catch (RuntimeException exception) {
             logger.error("Unexpected Activity dispatcher failure; queued state is retained", exception);
