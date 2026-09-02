@@ -389,8 +389,9 @@ public final class DurableActivityQueue {
     }
 
     /**
-     * Appends one complete journal record and fsyncs it. New file creation also
-     * fsyncs the parent directory on POSIX so the directory entry is durable.
+     * Appends one complete journal record and fsyncs it. The first successful
+     * record also fsyncs the full ancestor-directory chain on POSIX so retries
+     * after a failed initial directory/file durability step cannot skip it.
      * If a write or force fails after a partial record was written, the file is
      * truncated back to its original boundary before the failure is reported.
      * Future appends refuse a non-newline EOF, so a failed rollback cannot be
@@ -398,8 +399,7 @@ public final class DurableActivityQueue {
      */
     private static void appendForced(Path path, String content) throws IOException {
         ensureParent(path);
-        boolean existed = Files.exists(path);
-        long originalSize = existed ? Files.size(path) : 0L;
+        long originalSize = Files.exists(path) ? Files.size(path) : 0L;
         verifyAppendBoundary(path, originalSize);
 
         ByteBuffer buffer = ByteBuffer.wrap(content.getBytes(StandardCharsets.UTF_8));
@@ -413,8 +413,8 @@ public final class DurableActivityQueue {
                     channel.write(buffer);
                 }
                 channel.force(true);
-                if (!existed) {
-                    forceParentDirectory(path);
+                if (originalSize == 0L) {
+                    forceAncestorDirectories(path);
                 }
             } catch (IOException appendFailure) {
                 try {
@@ -445,22 +445,33 @@ public final class DurableActivityQueue {
         }
     }
 
+    private static void forceAncestorDirectories(Path path) throws IOException {
+        Path directory = path.getParent();
+        while (directory != null) {
+            forceDirectory(directory);
+            directory = directory.getParent();
+        }
+    }
+
     private static void forceParentDirectory(Path path) throws IOException {
         Path parent = path.getParent();
-        if (parent == null) {
-            return;
+        if (parent != null) {
+            forceDirectory(parent);
         }
-        try (FileChannel directory = FileChannel.open(parent, StandardOpenOption.READ)) {
-            directory.force(true);
+    }
+
+    private static void forceDirectory(Path directory) throws IOException {
+        try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
+            channel.force(true);
         } catch (UnsupportedOperationException | IOException exception) {
             // Java/Windows commonly cannot open a directory as FileChannel.
-            // Production Minecraft runs on Linux, where parent fsync is part of
-            // the durability guarantee. Keep local Windows development usable.
+            // Production Minecraft runs on Linux, where directory fsync is part
+            // of the durability guarantee. Keep local Windows development usable.
             if (!isWindows()) {
                 if (exception instanceof IOException ioException) {
                     throw ioException;
                 }
-                throw new IOException("Could not fsync Activity journal parent directory", exception);
+                throw new IOException("Could not fsync Activity journal directory", exception);
             }
         }
     }
@@ -471,20 +482,8 @@ public final class DurableActivityQueue {
 
     private static void ensureParent(Path path) throws IOException {
         Path parent = path.getParent();
-        if (parent == null || Files.exists(parent)) {
-            return;
-        }
-
-        List<Path> missingDirectories = new ArrayList<>();
-        Path current = parent;
-        while (current != null && !Files.exists(current)) {
-            missingDirectories.add(current);
-            current = current.getParent();
-        }
-
-        Files.createDirectories(parent);
-        for (int index = missingDirectories.size() - 1; index >= 0; index--) {
-            forceParentDirectory(missingDirectories.get(index));
+        if (parent != null) {
+            Files.createDirectories(parent);
         }
     }
 }
