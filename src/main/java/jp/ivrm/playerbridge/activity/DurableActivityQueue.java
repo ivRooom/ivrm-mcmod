@@ -13,16 +13,30 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.function.Consumer;
 
 /**
- * Bounded NDJSON-backed queue. Every gameplay event is persisted before any
- * network attempt. Malformed queue records are quarantined instead of blocking
- * server startup.
+ * Bounded NDJSON-backed durable queue.
+ *
+ * <p>The queue file is an append-only journal: new events, retry state and
+ * acknowledgements are fsynced as individual records. Periodic compaction is
+ * performed by the dispatcher thread, avoiding a full-backlog rewrite for each
+ * delivery. Malformed records are quarantined before they are removed from the
+ * active journal.</p>
  */
 public final class DurableActivityQueue {
+    private static final int COMPACT_AFTER_MUTATIONS = 512;
+
+    public enum EnqueueResult {
+        ACTIVE,
+        DEAD_LETTERED,
+        RETRY_NEEDED
+    }
+
     public record QueueEntry(
             String eventId,
             String body,
@@ -40,6 +54,7 @@ public final class DurableActivityQueue {
     private final int maxEntries;
     private final Consumer<String> diagnostic;
     private final List<QueueEntry> entries = new ArrayList<>();
+    private int mutationsSinceCompaction;
 
     public DurableActivityQueue(
             Path queuePath,
@@ -55,21 +70,30 @@ public final class DurableActivityQueue {
         restore();
     }
 
-    public synchronized boolean enqueue(String eventId, String body, Instant now) {
+    public synchronized EnqueueResult enqueue(String eventId, String body, Instant now) {
         QueueEntry entry = new QueueEntry(eventId, body, 0, now.toEpochMilli(), now.toString());
         if (entries.size() >= maxEntries) {
-            appendDeadLetter(entry, "queue_full");
-            diagnostic.accept("Activity queue is full; event moved to dead-letter: eventId=" + eventId);
-            return false;
+            if (appendDeadLetter(entry, "queue_full")) {
+                diagnostic.accept("Activity queue is full; event moved to dead-letter: eventId=" + eventId);
+                return EnqueueResult.DEAD_LETTERED;
+            }
+            diagnostic.accept("Activity queue is full and dead-letter persistence failed; event retained for retry");
+            return EnqueueResult.RETRY_NEEDED;
         }
+
         try {
             appendForced(queuePath, serialize(entry) + System.lineSeparator());
             entries.add(entry);
-            return true;
+            mutationsSinceCompaction++;
+            maybeCompact();
+            return EnqueueResult.ACTIVE;
         } catch (IOException exception) {
-            appendDeadLetter(entry, "queue_write_failed");
-            diagnostic.accept("Failed to persist Activity event; event moved to dead-letter: eventId=" + eventId);
-            return false;
+            if (appendDeadLetter(entry, "queue_write_failed")) {
+                diagnostic.accept("Failed to persist Activity event; event moved to dead-letter: eventId=" + eventId);
+                return EnqueueResult.DEAD_LETTERED;
+            }
+            diagnostic.accept("Failed to persist Activity event or dead-letter; event retained in ingress for retry");
+            return EnqueueResult.RETRY_NEEDED;
         }
     }
 
@@ -79,72 +103,175 @@ public final class DurableActivityQueue {
                 .findFirst();
     }
 
-    public synchronized void markSuccess(String eventId) {
-        if (entries.removeIf(entry -> entry.eventId().equals(eventId))) {
-            rewriteQueue();
+    /**
+     * Persists an acknowledgement before removing the active in-memory entry.
+     * A failed acknowledgement leaves the event retryable; receiver idempotency
+     * makes that safer than losing the only durable copy.
+     */
+    public synchronized boolean markSuccess(String eventId) {
+        int index = findIndex(eventId);
+        if (index < 0) {
+            return false;
         }
+        if (!appendTombstone(eventId, "accepted")) {
+            diagnostic.accept("Failed to persist Activity acknowledgement; event retained for replay: eventId=" + eventId);
+            return false;
+        }
+        entries.remove(index);
+        mutationsSinceCompaction++;
+        maybeCompact();
+        return true;
     }
 
-    public synchronized int markRetry(String eventId, long nextAttemptAtEpochMillis) {
-        for (int index = 0; index < entries.size(); index++) {
-            QueueEntry entry = entries.get(index);
-            if (entry.eventId().equals(eventId)) {
-                QueueEntry updated = entry.withRetry(entry.attempts() + 1, nextAttemptAtEpochMillis);
-                entries.set(index, updated);
-                rewriteQueue();
-                return updated.attempts();
-            }
+    /** Persists retry state before updating the active in-memory entry. */
+    public synchronized boolean markRetry(String eventId, long nextAttemptAtEpochMillis) {
+        int index = findIndex(eventId);
+        if (index < 0) {
+            return false;
         }
-        return 0;
+        QueueEntry entry = entries.get(index);
+        QueueEntry updated = entry.withRetry(entry.attempts() + 1, nextAttemptAtEpochMillis);
+        try {
+            appendForced(queuePath, serialize(updated) + System.lineSeparator());
+        } catch (IOException exception) {
+            diagnostic.accept("Failed to persist Activity retry state; original event remains active: eventId=" + eventId);
+            return false;
+        }
+        entries.set(index, updated);
+        mutationsSinceCompaction++;
+        maybeCompact();
+        return true;
     }
 
-    public synchronized void moveToDeadLetter(String eventId, String reason) {
-        for (int index = 0; index < entries.size(); index++) {
-            QueueEntry entry = entries.get(index);
-            if (entry.eventId().equals(eventId)) {
-                appendDeadLetter(entry, reason);
-                entries.remove(index);
-                rewriteQueue();
-                return;
-            }
+    /**
+     * Dead-letter persistence is committed first. The active entry is removed
+     * only after both the dead-letter record and queue tombstone are durable.
+     */
+    public synchronized boolean moveToDeadLetter(String eventId, String reason) {
+        int index = findIndex(eventId);
+        if (index < 0) {
+            return false;
         }
+        QueueEntry entry = entries.get(index);
+        if (!appendDeadLetter(entry, reason)) {
+            diagnostic.accept("Activity dead-letter persistence failed; active event retained: eventId=" + eventId);
+            return false;
+        }
+        if (!appendTombstone(eventId, "dead_lettered")) {
+            diagnostic.accept("Activity queue tombstone failed after dead-letter append; active event retained: eventId=" + eventId);
+            return false;
+        }
+        entries.remove(index);
+        mutationsSinceCompaction++;
+        maybeCompact();
+        return true;
     }
 
     public synchronized int size() {
         return entries.size();
     }
 
+    private int findIndex(String eventId) {
+        for (int index = 0; index < entries.size(); index++) {
+            if (entries.get(index).eventId().equals(eventId)) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
     private void restore() {
         if (!Files.exists(queuePath)) {
             return;
         }
+
+        List<String> lines;
         try {
-            for (String line : Files.readAllLines(queuePath, StandardCharsets.UTF_8)) {
-                if (line.isBlank()) continue;
-                try {
-                    QueueEntry entry = parse(line);
-                    if (entries.size() >= maxEntries) {
-                        appendDeadLetter(entry, "queue_overflow_on_restore");
-                    } else {
-                        entries.add(entry);
-                    }
-                } catch (RuntimeException exception) {
-                    quarantineCorruptLine(line, "invalid_queue_record");
-                    diagnostic.accept("Quarantined one malformed Activity queue record");
-                }
-            }
-            rewriteQueue();
+            lines = Files.readAllLines(queuePath, StandardCharsets.UTF_8);
         } catch (IOException exception) {
-            diagnostic.accept("Activity queue restore failed; sender continues with an empty in-memory queue");
+            quarantineUnreadableQueue(exception);
+            return;
+        }
+
+        Map<String, QueueEntry> restored = new LinkedHashMap<>();
+        boolean needsCompaction = false;
+        for (String line : lines) {
+            if (line.isBlank()) {
+                continue;
+            }
+            try {
+                JsonObject object = JsonParser.parseString(line).getAsJsonObject();
+                String eventId = object.get("eventId").getAsString();
+                if (object.has("removed") && object.get("removed").getAsBoolean()) {
+                    restored.remove(eventId);
+                    needsCompaction = true;
+                    continue;
+                }
+
+                QueueEntry entry = parse(object);
+                boolean replacing = restored.containsKey(entry.eventId());
+                if (!replacing && restored.size() >= maxEntries) {
+                    if (!appendDeadLetter(entry, "queue_overflow_on_restore")) {
+                        throw new IllegalStateException("Failed to preserve overflowed Activity queue record");
+                    }
+                    needsCompaction = true;
+                    continue;
+                }
+                if (restored.put(entry.eventId(), entry) != null) {
+                    needsCompaction = true;
+                }
+            } catch (RuntimeException exception) {
+                if (!quarantineCorruptLine(line, "invalid_queue_record")) {
+                    throw new IllegalStateException(
+                            "Activity queue contains a malformed record that could not be quarantined");
+                }
+                diagnostic.accept("Quarantined one malformed Activity queue record");
+                needsCompaction = true;
+            }
+        }
+
+        entries.addAll(restored.values());
+        if (needsCompaction && !compactQueue()) {
+            diagnostic.accept("Activity queue startup compaction failed; original append-only journal remains authoritative");
         }
     }
 
-    private void rewriteQueue() {
+    private void quarantineUnreadableQueue(IOException cause) {
+        Path quarantine = queuePath.resolveSibling(
+                queuePath.getFileName() + ".unreadable-" + System.currentTimeMillis());
+        try {
+            try {
+                Files.move(queuePath, quarantine, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException ignored) {
+                Files.move(queuePath, quarantine);
+            }
+            diagnostic.accept("Unreadable Activity queue was isolated intact before sender startup");
+        } catch (IOException moveFailure) {
+            IllegalStateException failure = new IllegalStateException(
+                    "Activity queue could not be restored or isolated; sender must remain disabled",
+                    moveFailure);
+            failure.addSuppressed(cause);
+            throw failure;
+        }
+    }
+
+    private void maybeCompact() {
+        if (mutationsSinceCompaction < COMPACT_AFTER_MUTATIONS) {
+            return;
+        }
+        if (!compactQueue()) {
+            diagnostic.accept("Activity queue compaction failed; append-only journal remains authoritative");
+        }
+    }
+
+    private boolean compactQueue() {
         try {
             if (entries.isEmpty()) {
                 Files.deleteIfExists(queuePath);
-                return;
+                mutationsSinceCompaction = 0;
+                return true;
             }
+
             ensureParent(queuePath);
             Path temp = queuePath.resolveSibling(queuePath.getFileName() + ".tmp");
             StringBuilder content = new StringBuilder();
@@ -166,31 +293,51 @@ public final class DurableActivityQueue {
             } catch (AtomicMoveNotSupportedException ignored) {
                 Files.move(temp, queuePath, StandardCopyOption.REPLACE_EXISTING);
             }
+            mutationsSinceCompaction = 0;
+            return true;
         } catch (IOException exception) {
-            diagnostic.accept("Failed to rewrite Activity queue; retained in-memory state for this process");
+            return false;
         }
     }
 
-    private void appendDeadLetter(QueueEntry entry, String reason) {
+    private boolean appendTombstone(String eventId, String disposition) {
+        JsonObject object = new JsonObject();
+        object.addProperty("eventId", eventId);
+        object.addProperty("removed", true);
+        object.addProperty("disposition", disposition);
+        object.addProperty("recordedAt", Instant.now().toString());
+        try {
+            appendForced(queuePath, object + System.lineSeparator());
+            return true;
+        } catch (IOException exception) {
+            return false;
+        }
+    }
+
+    private boolean appendDeadLetter(QueueEntry entry, String reason) {
         JsonObject object = JsonParser.parseString(serialize(entry)).getAsJsonObject();
         object.addProperty("reason", reason);
         object.addProperty("deadLetteredAt", Instant.now().toString());
         try {
             appendForced(deadLetterPath, object + System.lineSeparator());
+            return true;
         } catch (IOException exception) {
             diagnostic.accept("Failed to persist Activity dead-letter record: eventId=" + entry.eventId());
+            return false;
         }
     }
 
-    private void quarantineCorruptLine(String raw, String reason) {
+    private boolean quarantineCorruptLine(String raw, String reason) {
         JsonObject object = new JsonObject();
         object.addProperty("raw", raw);
         object.addProperty("reason", reason);
         object.addProperty("quarantinedAt", Instant.now().toString());
         try {
             appendForced(corruptPath, object + System.lineSeparator());
+            return true;
         } catch (IOException exception) {
             diagnostic.accept("Failed to persist corrupt Activity queue record");
+            return false;
         }
     }
 
@@ -204,8 +351,7 @@ public final class DurableActivityQueue {
         return object.toString();
     }
 
-    private static QueueEntry parse(String line) {
-        JsonObject object = JsonParser.parseString(line).getAsJsonObject();
+    private static QueueEntry parse(JsonObject object) {
         return new QueueEntry(
                 object.get("eventId").getAsString(),
                 object.get("body").getAsString(),
@@ -216,13 +362,15 @@ public final class DurableActivityQueue {
 
     private static void appendForced(Path path, String content) throws IOException {
         ensureParent(path);
-        byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+        ByteBuffer buffer = ByteBuffer.wrap(content.getBytes(StandardCharsets.UTF_8));
         try (FileChannel channel = FileChannel.open(
                 path,
                 StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE,
                 StandardOpenOption.APPEND)) {
-            channel.write(ByteBuffer.wrap(bytes));
+            while (buffer.hasRemaining()) {
+                channel.write(buffer);
+            }
             channel.force(true);
         }
     }
