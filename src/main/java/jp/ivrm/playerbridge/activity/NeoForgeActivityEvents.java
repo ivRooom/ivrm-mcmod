@@ -98,9 +98,9 @@ public final class NeoForgeActivityEvents {
 
     @SubscribeEvent
     public void onServerStopped(ServerStoppedEvent event) {
-        // Keep the dispatcher alive through the final PlayerLoggedOutEvent events.
-        // close() performs one last persistence/drain pass before termination.
-        runtime.flushAsync();
+        // Keep the dispatcher alive through final PlayerLoggedOutEvent handling.
+        // close() synchronously persists accepted ingress before interrupting
+        // any in-flight HTTP request, so network latency cannot skip durability.
         runtime.close();
         players.clear();
     }
