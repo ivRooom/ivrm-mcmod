@@ -53,9 +53,10 @@ configurations {
 
 dependencies {
     testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
-    // NeoForge supplies Gson to the main mod compile/runtime classpath, but that
-    // transitive does not reach the standalone unit-test source set.
+    // NeoForge supplies Gson and SLF4J to the main mod compile/runtime classpath,
+    // but those transitives do not reach the standalone unit-test source set.
     testImplementation 'com.google.code.gson:gson:2.14.0'
+    testImplementation 'org.slf4j:slf4j-api:2.0.17'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.11.4'
 }
 
