@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -53,6 +54,45 @@ final class DurableActivityQueueTest {
     }
 
     @Test
+    void restoreAppliesCapacityAfterReplayingLaterTombstones() throws Exception {
+        Paths paths = paths();
+        DurableActivityQueue original = queue(paths, 2);
+        assertEquals(
+                DurableActivityQueue.EnqueueResult.ACTIVE,
+                original.enqueue("A", "{\"value\":1}", Instant.parse("2026-09-02T00:00:00Z")));
+        assertEquals(
+                DurableActivityQueue.EnqueueResult.ACTIVE,
+                original.enqueue("B", "{\"value\":2}", Instant.parse("2026-09-02T00:00:01Z")));
+        assertTrue(original.markSuccess("A"));
+
+        DurableActivityQueue restored = queue(paths, 1);
+
+        assertEquals(1, restored.size());
+        assertEquals("B", restored.nextDue(Long.MAX_VALUE).orElseThrow().eventId());
+        assertFalse(Files.exists(paths.deadLetter));
+    }
+
+    @Test
+    void restoreDeadLettersOnlyFinalActiveOverflow() throws Exception {
+        Paths paths = paths();
+        DurableActivityQueue original = queue(paths, 2);
+        assertEquals(
+                DurableActivityQueue.EnqueueResult.ACTIVE,
+                original.enqueue("A", "{\"value\":1}", Instant.parse("2026-09-02T00:00:00Z")));
+        assertEquals(
+                DurableActivityQueue.EnqueueResult.ACTIVE,
+                original.enqueue("B", "{\"value\":2}", Instant.parse("2026-09-02T00:00:01Z")));
+
+        DurableActivityQueue restored = queue(paths, 1);
+
+        assertEquals(1, restored.size());
+        assertEquals("A", restored.nextDue(Long.MAX_VALUE).orElseThrow().eventId());
+        String deadLetter = Files.readString(paths.deadLetter, StandardCharsets.UTF_8);
+        assertTrue(deadLetter.contains("\"eventId\":\"B\""));
+        assertTrue(deadLetter.contains("\"reason\":\"queue_overflow_on_restore\""));
+    }
+
+    @Test
     void restoreOverflowFailureAbortsWithoutQuarantiningValidRecord() throws Exception {
         Paths paths = paths();
         DurableActivityQueue original = queue(paths, 2);
@@ -69,6 +109,32 @@ final class DurableActivityQueueTest {
 
         assertEquals(originalJournal, Files.readString(paths.queue, StandardCharsets.UTF_8));
         assertFalse(Files.exists(paths.corrupt));
+    }
+
+    @Test
+    void refusesToAppendAfterJournalBoundaryBecomesIncomplete() throws Exception {
+        Paths paths = paths();
+        DurableActivityQueue queue = queue(paths, 10);
+        assertEquals(
+                DurableActivityQueue.EnqueueResult.ACTIVE,
+                queue.enqueue("one", "{\"value\":1}", Instant.parse("2026-09-02T00:00:00Z")));
+
+        Files.writeString(
+                paths.queue,
+                "partial-record",
+                StandardCharsets.UTF_8,
+                StandardOpenOption.APPEND);
+        String damagedJournal = Files.readString(paths.queue, StandardCharsets.UTF_8);
+
+        assertEquals(
+                DurableActivityQueue.EnqueueResult.DEAD_LETTERED,
+                queue.enqueue("two", "{\"value\":2}", Instant.parse("2026-09-02T00:00:01Z")));
+
+        assertEquals(damagedJournal, Files.readString(paths.queue, StandardCharsets.UTF_8));
+        assertFalse(Files.readString(paths.queue, StandardCharsets.UTF_8).contains("\"eventId\":\"two\""));
+        String deadLetter = Files.readString(paths.deadLetter, StandardCharsets.UTF_8);
+        assertTrue(deadLetter.contains("\"eventId\":\"two\""));
+        assertTrue(deadLetter.contains("\"reason\":\"queue_write_failed\""));
     }
 
     @Test
