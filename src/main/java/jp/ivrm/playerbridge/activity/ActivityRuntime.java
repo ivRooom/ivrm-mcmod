@@ -186,13 +186,32 @@ public final class ActivityRuntime implements AutoCloseable {
     /**
      * Orderly shutdown durability barrier. This method performs no HTTP work and
      * runs before the dispatcher is interrupted, so an in-flight request cannot
-     * prevent accepted ingress from reaching durable storage.
+     * prevent accepted ingress from reaching durable storage. Accepted ingress
+     * is allowed to spill past the normal active-queue capacity during shutdown;
+     * preserving an already-accepted event is more important than the steady-
+     * state capacity bound at process termination.
      */
     private boolean persistAllIngressForShutdown() {
         synchronized (persistenceLock) {
             while (!ingress.isEmpty()) {
-                if (!persistIngressBatchLocked()) {
+                PendingEvent pending = ingress.peek();
+                if (pending == null) {
+                    return true;
+                }
+
+                DurableActivityQueue.EnqueueResult result =
+                        queue.enqueueForShutdown(pending.eventId(), pending.body(), pending.occurredAt());
+                if (result == DurableActivityQueue.EnqueueResult.RETRY_NEEDED) {
+                    logger.error("Activity shutdown persistence unavailable; accepted ingress head retained in RAM");
                     return false;
+                }
+
+                ingress.poll();
+                if (result == DurableActivityQueue.EnqueueResult.DEAD_LETTERED) {
+                    logger.error(
+                            "Activity shutdown event could not be written to the active journal and was preserved in dead-letter: eventId={}, type={}",
+                            pending.eventId(),
+                            pending.type());
                 }
             }
             return true;
