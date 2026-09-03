@@ -56,6 +56,7 @@ public final class DurableActivityQueue {
     private final Consumer<String> diagnostic;
     private final List<QueueEntry> entries = new ArrayList<>();
     private int mutationsSinceCompaction;
+    private boolean queueMetadataSyncPending;
 
     public DurableActivityQueue(
             Path queuePath,
@@ -72,6 +73,11 @@ public final class DurableActivityQueue {
     }
 
     public synchronized EnqueueResult enqueue(String eventId, String body, Instant now) {
+        if (!ensureQueueMetadataDurable()) {
+            diagnostic.accept("Activity queue metadata durability is unresolved; event retained for retry");
+            return EnqueueResult.RETRY_NEEDED;
+        }
+
         QueueEntry entry = new QueueEntry(eventId, body, 0, now.toEpochMilli(), now.toString());
         if (entries.size() >= maxEntries) {
             if (appendDeadLetter(entry, "queue_full")) {
@@ -82,6 +88,25 @@ public final class DurableActivityQueue {
             return EnqueueResult.RETRY_NEEDED;
         }
 
+        return appendActiveEntry(entry, "queue_write_failed");
+    }
+
+    /**
+     * Orderly-shutdown persistence path. Events already accepted into the
+     * in-memory ingress must become durable even when the normal active-queue
+     * capacity is currently full. This may temporarily exceed maxEntries; on
+     * restart the existing restore-capacity policy reconciles any overflow.
+     */
+    public synchronized EnqueueResult enqueueForShutdown(String eventId, String body, Instant now) {
+        if (!ensureQueueMetadataDurable()) {
+            diagnostic.accept("Activity queue metadata durability is unresolved during shutdown; ingress retained");
+            return EnqueueResult.RETRY_NEEDED;
+        }
+        QueueEntry entry = new QueueEntry(eventId, body, 0, now.toEpochMilli(), now.toString());
+        return appendActiveEntry(entry, "shutdown_queue_write_failed");
+    }
+
+    private EnqueueResult appendActiveEntry(QueueEntry entry, String deadLetterReason) {
         try {
             appendForced(queuePath, serialize(entry) + System.lineSeparator());
             entries.add(entry);
@@ -89,8 +114,9 @@ public final class DurableActivityQueue {
             maybeCompact();
             return EnqueueResult.ACTIVE;
         } catch (IOException exception) {
-            if (appendDeadLetter(entry, "queue_write_failed")) {
-                diagnostic.accept("Failed to persist Activity event; event moved to dead-letter: eventId=" + eventId);
+            if (appendDeadLetter(entry, deadLetterReason)) {
+                diagnostic.accept("Failed to persist Activity event in the active queue; event moved to dead-letter: eventId="
+                        + entry.eventId());
                 return EnqueueResult.DEAD_LETTERED;
             }
             diagnostic.accept("Failed to persist Activity event or dead-letter; event retained in ingress for retry");
@@ -99,6 +125,10 @@ public final class DurableActivityQueue {
     }
 
     public synchronized Optional<QueueEntry> nextDue(long nowEpochMillis) {
+        if (!ensureQueueMetadataDurable()) {
+            diagnostic.accept("Activity queue delivery paused until directory metadata durability is confirmed");
+            return Optional.empty();
+        }
         return entries.stream()
                 .filter(entry -> entry.nextAttemptAtEpochMillis() <= nowEpochMillis)
                 .findFirst();
@@ -110,6 +140,9 @@ public final class DurableActivityQueue {
      * makes that safer than losing the only durable copy.
      */
     public synchronized boolean markSuccess(String eventId) {
+        if (!ensureQueueMetadataDurable()) {
+            return false;
+        }
         int index = findIndex(eventId);
         if (index < 0) {
             return false;
@@ -126,6 +159,9 @@ public final class DurableActivityQueue {
 
     /** Persists retry state before updating the active in-memory entry. */
     public synchronized boolean markRetry(String eventId, long nextAttemptAtEpochMillis) {
+        if (!ensureQueueMetadataDurable()) {
+            return false;
+        }
         int index = findIndex(eventId);
         if (index < 0) {
             return false;
@@ -149,6 +185,9 @@ public final class DurableActivityQueue {
      * only after both the dead-letter record and queue tombstone are durable.
      */
     public synchronized boolean moveToDeadLetter(String eventId, String reason) {
+        if (!ensureQueueMetadataDurable()) {
+            return false;
+        }
         int index = findIndex(eventId);
         if (index < 0) {
             return false;
@@ -186,12 +225,19 @@ public final class DurableActivityQueue {
             return;
         }
 
-        List<String> lines;
         try {
             repairTrailingRecordBoundary(queuePath);
+        } catch (IOException repairFailure) {
+            throw new IllegalStateException(
+                    "Activity queue trailing record boundary could not be repaired durably; sender must remain disabled",
+                    repairFailure);
+        }
+
+        List<String> lines;
+        try {
             lines = Files.readAllLines(queuePath, StandardCharsets.UTF_8);
-        } catch (IOException exception) {
-            quarantineUnreadableQueue(exception);
+        } catch (IOException readFailure) {
+            quarantineUnreadableQueue(readFailure);
             return;
         }
 
@@ -285,10 +331,20 @@ public final class DurableActivityQueue {
 
             ByteBuffer newline = ByteBuffer.wrap(System.lineSeparator().getBytes(StandardCharsets.UTF_8));
             channel.position(size);
-            while (newline.hasRemaining()) {
-                channel.write(newline);
+            try {
+                while (newline.hasRemaining()) {
+                    channel.write(newline);
+                }
+                channel.force(true);
+            } catch (IOException repairFailure) {
+                try {
+                    channel.truncate(size);
+                    channel.force(true);
+                } catch (IOException rollbackFailure) {
+                    repairFailure.addSuppressed(rollbackFailure);
+                }
+                throw repairFailure;
             }
-            channel.force(true);
             diagnostic.accept("Repaired an unterminated Activity queue tail before restore");
         }
     }
@@ -323,10 +379,19 @@ public final class DurableActivityQueue {
     }
 
     private boolean compactQueue() {
+        if (!ensureQueueMetadataDurable()) {
+            return false;
+        }
+
         try {
             if (entries.isEmpty()) {
                 if (Files.deleteIfExists(queuePath)) {
-                    forceParentDirectory(queuePath);
+                    try {
+                        forceParentDirectory(queuePath);
+                    } catch (IOException syncFailure) {
+                        queueMetadataSyncPending = true;
+                        return false;
+                    }
                 }
                 mutationsSinceCompaction = 0;
                 return true;
@@ -352,10 +417,32 @@ public final class DurableActivityQueue {
             // If the filesystem cannot provide ATOMIC_MOVE, leave queue.ndjson
             // untouched and treat compaction as failed/retryable.
             Files.move(temp, queuePath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            forceParentDirectory(queuePath);
+            try {
+                forceParentDirectory(queuePath);
+            } catch (IOException syncFailure) {
+                // The inode has already been atomically replaced, but the rename
+                // metadata is not yet confirmed durable. Stop delivery/mutations
+                // until a later operation successfully fsyncs the parent.
+                queueMetadataSyncPending = true;
+                return false;
+            }
             mutationsSinceCompaction = 0;
             return true;
         } catch (IOException exception) {
+            return false;
+        }
+    }
+
+    private boolean ensureQueueMetadataDurable() {
+        if (!queueMetadataSyncPending) {
+            return true;
+        }
+        try {
+            forceParentDirectory(queuePath);
+            queueMetadataSyncPending = false;
+            diagnostic.accept("Activity queue directory metadata durability was recovered");
+            return true;
+        } catch (IOException retryFailure) {
             return false;
         }
     }
