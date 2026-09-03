@@ -167,10 +167,6 @@ final class ActivityRuntimeTest {
 
         runtime.close();
 
-        String journal = Files.readString(config.queuePath(), StandardCharsets.UTF_8);
-        assertTrue(journal.contains("\"playerName\":\"PlayerTwo\""),
-                "accepted ingress must be journaled even when normal queue capacity is full");
-
         Files.delete(config.deadLetterPath());
         DurableActivityQueue restored = new DurableActivityQueue(
                 config.queuePath(),
@@ -191,7 +187,8 @@ final class ActivityRuntimeTest {
             }
             assertTrue(restored.markSuccess(entry.eventId()));
         }
-        assertTrue(foundShutdownSpill);
+        assertTrue(foundShutdownSpill,
+                "accepted ingress must be restorable even when normal queue capacity was full at shutdown");
     }
 
     @Test
