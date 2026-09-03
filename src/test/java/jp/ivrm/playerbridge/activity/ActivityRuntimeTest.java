@@ -140,6 +140,61 @@ final class ActivityRuntimeTest {
     }
 
     @Test
+    void closeSpillsAcceptedIngressPastFullQueueWhenDeadLetterIsUnavailable() throws Exception {
+        Path state = tempDir.resolve("shutdown-capacity-spill");
+        ActivityConfig config = config(state, URI.create("https://api.ivrm.jp"), 1);
+        DurableActivityQueue seed = restore(config);
+        assertEquals(
+                DurableActivityQueue.EnqueueResult.ACTIVE,
+                seed.enqueue(
+                        "018f4b20-8a6f-7a2a-8f4b-1234567890ab",
+                        "{\"eventId\":\"018f4b20-8a6f-7a2a-8f4b-1234567890ab\"}",
+                        Instant.parse("2026-09-02T00:00:00Z")));
+
+        // A directory at the dead-letter path makes normal overflow preservation
+        // fail, reproducing the capacity-blocked ingress state from the review.
+        Files.createDirectory(config.deadLetterPath());
+        Clock clock = Clock.fixed(Instant.parse("2026-09-02T00:01:00Z"), ZoneOffset.UTC);
+        ActivityRuntime runtime = new ActivityRuntime(
+                config,
+                LoggerFactory.getLogger(ActivityRuntimeTest.class),
+                clock);
+        runtime.emit(
+                "player.logout",
+                UUID.fromString("018f4b20-8a6f-7a2a-8f4b-1234567890ac"),
+                "PlayerTwo",
+                Map.of());
+
+        runtime.close();
+
+        String journal = Files.readString(config.queuePath(), StandardCharsets.UTF_8);
+        assertTrue(journal.contains("\"playerName\":\"PlayerTwo\""),
+                "accepted ingress must be journaled even when normal queue capacity is full");
+
+        Files.delete(config.deadLetterPath());
+        DurableActivityQueue restored = new DurableActivityQueue(
+                config.queuePath(),
+                config.deadLetterPath(),
+                config.corruptPath(),
+                2,
+                ignored -> {});
+        assertEquals(2, restored.size());
+        boolean foundShutdownSpill = false;
+        while (true) {
+            var due = restored.nextDue(Long.MAX_VALUE);
+            if (due.isEmpty()) {
+                break;
+            }
+            var entry = due.orElseThrow();
+            if (entry.body().contains("\"playerName\":\"PlayerTwo\"")) {
+                foundShutdownSpill = true;
+            }
+            assertTrue(restored.markSuccess(entry.eventId()));
+        }
+        assertTrue(foundShutdownSpill);
+    }
+
+    @Test
     void invalidSuccessfulAcknowledgementRetainsEventForRetry() throws Exception {
         String eventId = "018f4b20-8a6f-7a2a-8f4b-1234567890ab";
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
