@@ -310,7 +310,7 @@ public final class DurableActivityQueue {
     }
 
     private void repairJournalBoundaryIfPresent(Path path) throws IOException {
-        if (Files.exists(path)) {
+        if (Files.isRegularFile(path)) {
             repairTrailingRecordBoundary(path);
         }
     }
