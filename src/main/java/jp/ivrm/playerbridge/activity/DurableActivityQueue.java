@@ -221,16 +221,18 @@ public final class DurableActivityQueue {
     }
 
     private void restore() {
-        if (!Files.exists(queuePath)) {
-            return;
-        }
-
         try {
-            repairTrailingRecordBoundary(queuePath);
+            repairJournalBoundaryIfPresent(queuePath);
+            repairJournalBoundaryIfPresent(deadLetterPath);
+            repairJournalBoundaryIfPresent(corruptPath);
         } catch (IOException repairFailure) {
             throw new IllegalStateException(
-                    "Activity queue trailing record boundary could not be repaired durably; sender must remain disabled",
+                    "Activity journal trailing record boundary could not be repaired durably; sender must remain disabled",
                     repairFailure);
+        }
+
+        if (!Files.exists(queuePath)) {
+            return;
         }
 
         List<String> lines;
@@ -307,6 +309,12 @@ public final class DurableActivityQueue {
         }
     }
 
+    private void repairJournalBoundaryIfPresent(Path path) throws IOException {
+        if (Files.exists(path)) {
+            repairTrailingRecordBoundary(path);
+        }
+    }
+
     /**
      * A process crash can leave a fully written JSON record without its trailing
      * newline. Such a record is recoverable, but appendForced intentionally
@@ -345,7 +353,7 @@ public final class DurableActivityQueue {
                 }
                 throw repairFailure;
             }
-            diagnostic.accept("Repaired an unterminated Activity queue tail before restore");
+            diagnostic.accept("Repaired an unterminated Activity journal tail before restore: " + path.getFileName());
         }
     }
 
