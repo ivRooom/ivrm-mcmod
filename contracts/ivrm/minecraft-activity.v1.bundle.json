@@ -1,0 +1,97 @@
+{
+  "bundleVersion": 1,
+  "contract": {
+    "id": "minecraft-activity",
+    "version": "1.0.0",
+    "sourceRepository": "ivRooom/ivrm-contracts"
+  },
+  "ingestActivityEvent": {
+    "method": "POST",
+    "path": "/v1/minecraft/activity-events",
+    "contentType": "application/json",
+    "authentication": {
+      "type": "hmac-sha256",
+      "headers": ["X-IVRM-Server-Id", "X-IVRM-Timestamp", "X-IVRM-Event-Id", "X-IVRM-Signature"],
+      "canonicalPayload": "METHOD\\nPATH\\nTIMESTAMP\\nEVENT_ID\\nBODY",
+      "pathExcludesQuery": true,
+      "timestamp": {
+        "meaning": "request-attempt-time",
+        "maxSkewSeconds": 300,
+        "retryResigns": true,
+        "preserveEventFieldsOnRetry": ["eventId", "occurredAt"]
+      }
+    },
+    "event": {
+      "required": ["schemaVersion", "eventId", "type", "playerUuid", "playerName", "serverRole", "occurredAt", "sequence", "attributes"],
+      "additionalProperties": false,
+      "schemaVersion": 1,
+      "types": ["player.login", "player.logout", "player.heartbeat", "player.afk_changed", "player.stat_delta"],
+      "serverRoles": ["main", "resource"],
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://ivrm.jp/contracts/minecraft/activity/v1/activity-event.schema.json",
+        "title": "Minecraft Activity Event v1",
+        "description": "Canonical activity fact emitted by ivrm-mcmod and ingested by ivrm-web. X-IVRM-Server-Id carries the configured physical server identity; serverRole is the logical main/resource role observed by the producer.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schemaVersion", "eventId", "type", "playerUuid", "playerName", "serverRole", "occurredAt", "sequence", "attributes"],
+        "properties": {
+          "schemaVersion": {
+            "const": 1
+          },
+          "eventId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["player.login", "player.logout", "player.heartbeat", "player.afk_changed", "player.stat_delta"],
+            "description": "AFK is emitted only when the observed AFK state changes. stat_delta represents a producer-observed change, not an absolute canonical aggregate. Event-specific attribute keys remain migration-compatible in v1 and must not contain credentials or player chat."
+          },
+          "playerUuid": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "playerName": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The Minecraft server-supplied name at the event time. It is not the ivRooom member display name."
+          },
+          "serverRole": {
+            "type": "string",
+            "enum": ["main", "resource"],
+            "description": "Logical server role. The configured server identity used for authentication is carried separately in X-IVRM-Server-Id."
+          },
+          "occurredAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:[0-5]\\d(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+            "description": "RFC 3339 source-event timestamp. Retries must preserve the original occurredAt value. The v1 operational profile rejects leap-second :60 timestamps so Producer and Consumer runtimes use the same parseable subset."
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Monotonic only within the producer process; consumers must not infer global ordering from this field."
+          },
+          "attributes": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Event-specific, non-sensitive string metadata. v1 intentionally keeps event-specific keys migration-compatible while legacy AFK/stat behavior is consolidated. Keys and values must not contain credentials or player chat."
+          }
+        }
+      }
+    },
+    "response": {
+      "newStatusCode": 202,
+      "replayStatusCode": 200,
+      "replayedByStatus": {
+        "200": true,
+        "202": false
+      },
+      "required": ["status", "eventId", "replayed"],
+      "status": "accepted"
+    }
+  }
+}
