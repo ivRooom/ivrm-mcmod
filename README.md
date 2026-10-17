@@ -93,3 +93,7 @@ gradle -p mods/ivrm-permission-integration --no-daemon clean build
 ```
 
 GitHub Actionsでは両方を独立してビルドします。
+
+## Agent Skills / 安全な運用
+
+[Agent Skills](.agents/skills/README.md) でActivity Event Producerの切替・Player Bridgeの障害調査を整理しています。横断的なMCP/Plugin接続や高リスク変更の承認は [ivrm-platformの共通スキル](https://github.com/ivRooom/ivrm-platform/tree/main/.agents/skills) を使用してください。Java/NeoForge/稼働中Worldの実態と最新CIを毎回確認します。
