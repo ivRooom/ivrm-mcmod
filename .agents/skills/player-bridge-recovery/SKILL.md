@@ -19,6 +19,16 @@ description: ivrm-mcmodのMain↔Resource Player Bridge実装・データ整合�
 4. 状態遷移（`PREPARED`, `IN_TRANSIT`, `IMPORTED`, `COMMITTED`）と実装状態が一致するか確認。特に `IMPORTED` 後のsourceへの無条件rollbackは複製リスクがある。
 5. Mainワールド、アイテム、Bridge storeの最新Backupと復元手順を先に検証。復旧操作はread-only調査・事前の別環境rehearsalを優先。
 6. 反映済みか判定できないときは自動復元せず `ADMIN_REVIEW` として停止し、Operator承認のもと個別対処。
+### `RECOVERY_REQUIRED` の遷移判定（運用上の判定基準）
+
+`BridgeTransitions.java` は `RECOVERY_REQUIRED` から `ROLLED_BACK` / `IMPORTED` / `ADMIN_REVIEW` への遷移を**構文上許可**するが、そのまま復旧操作の安全性を保証しない。以下の確認は復旧操作に進むための提案基準であり、実際の復旧コマンド・実装の検証前に本番で状態を書き換えない。
+
+- **共通証拠:** `state.json` のtransferId/generation/source/targetと `current.nbt`・SHA-256一致、関連する `lease.json` と両サーバーのonline/offline、送信元escrow、双方の最後に適用したgeneration/transferId、バックアップ時点、保留中処理を確認。矛盾/欠損/同時ログインがあれば操作を中断。
+- **`ROLLED_BACK` を選べる条件:** 宛先で当該transferId/generationが未適用であり、プレイヤーデータにも当該アイテム・経験値が反映されていないことを両側で確認できる。送信元のスナップショットが完全で、適用済み世代より新しいデータを上書きせず、二重復元も発生しない。どれか一つでも不明ならこの遷移を選ばない。
+- **`IMPORTED` を選べる条件:** 宛先に正しいtransferId/generationの適用証跡があり、対象データが宛先に存在することを確認できる。送信元が未復元・escrow状態であることも検証し、宛先の保存完了確認・commit retryへ進める。実保存が確認できないまま`COMMITTED`扱いにしない。
+- **`ADMIN_REVIEW` を選ぶ条件:** 上記のいずれも証明できない、SHA/世代/leaseが不整合、宛先適用済みの可能性が否定できない、または証拠が欠ける場合。データを保全し、OP/管理者が個別に判断するまで自動復元しない。
+- 各遷移は現行実装の対応コマンドとテストの有無を確認し、Operator承認・前後スナップショット/監査・復旧後のアイテム差分0を必須とする。
+
 7. Release前は `docs/player-bridge/test-plan.md` に沿って正常往復、アイテムData Components、Backpack、満杯Inventory、連打、切断、Crash、replay、20回連続往復、Admin権限の拒否を検証。
 
 ## 公開/承認ゲート
