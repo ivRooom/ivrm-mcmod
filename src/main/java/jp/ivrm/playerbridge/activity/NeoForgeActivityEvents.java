@@ -3,6 +3,7 @@ package jp.ivrm.playerbridge.activity;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import net.minecraft.server.level.ServerPlayer;
@@ -33,7 +34,11 @@ public final class NeoForgeActivityEvents {
             return;
         }
         Instant now = runtime.now();
-        players.put(player.getUUID(), PlayerState.from(player, now));
+        PlayerState state = PlayerState.from(player, now);
+        // The first snapshot only establishes the statistics baseline, so a
+        // player's pre-login history is never reported as one large delta.
+        state.observeStats(player);
+        players.put(player.getUUID(), state);
         emit(player, "player.login", Map.of());
     }
 
@@ -41,6 +46,10 @@ public final class NeoForgeActivityEvents {
     public void onLogout(PlayerEvent.PlayerLoggedOutEvent event) {
         if (!(event.getEntity() instanceof ServerPlayer player) || !runtime.enabled()) {
             return;
+        }
+        PlayerState state = players.get(player.getUUID());
+        if (state != null) {
+            flushStats(player, state);
         }
         emit(player, "player.logout", Map.of());
         players.remove(player.getUUID());
@@ -93,6 +102,20 @@ public final class NeoForgeActivityEvents {
                 state.lastHeartbeatAt = now;
                 emit(player, "player.heartbeat", Map.of("afk", Boolean.toString(state.afk)));
             }
+
+            if (Duration.between(state.lastStatsFlushAt, now).getSeconds()
+                    >= runtime.config().statsSeconds()) {
+                state.lastStatsFlushAt = now;
+                flushStats(player, state);
+            }
+        }
+    }
+
+    private void flushStats(ServerPlayer player, PlayerState state) {
+        for (PlayerStatsDiffer.StatDelta delta : state.observeStats(player)) {
+            emit(player, "player.stat_delta", Map.of(
+                    "stat", delta.stat(),
+                    "delta", Integer.toString(delta.delta())));
         }
     }
 
@@ -110,6 +133,7 @@ public final class NeoForgeActivityEvents {
     }
 
     private static final class PlayerState {
+        private final PlayerStatsDiffer statsDiffer = new PlayerStatsDiffer();
         private double x;
         private double y;
         private double z;
@@ -117,6 +141,7 @@ public final class NeoForgeActivityEvents {
         private float pitch;
         private Instant lastActiveAt;
         private Instant lastHeartbeatAt;
+        private Instant lastStatsFlushAt;
         private boolean afk;
 
         static PlayerState from(ServerPlayer player, Instant now) {
@@ -128,7 +153,12 @@ public final class NeoForgeActivityEvents {
             state.pitch = player.getXRot();
             state.lastActiveAt = now;
             state.lastHeartbeatAt = now;
+            state.lastStatsFlushAt = now;
             return state;
+        }
+
+        List<PlayerStatsDiffer.StatDelta> observeStats(ServerPlayer player) {
+            return statsDiffer.diff(VanillaPlayerStats.snapshot(player));
         }
 
         boolean observeMovement(ServerPlayer player, Instant now) {

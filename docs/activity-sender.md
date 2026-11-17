@@ -68,6 +68,7 @@ Optional tuning:
 | `IVRM_ACTIVITY_REQUEST_TIMEOUT_SECONDS` | `10` |
 | `IVRM_ACTIVITY_HEARTBEAT_SECONDS` | `30` |
 | `IVRM_ACTIVITY_AFK_SECONDS` | `300` |
+| `IVRM_ACTIVITY_STATS_SECONDS` | `300` |
 | `IVRM_ACTIVITY_QUEUE_MAX` | `10000` |
 | `IVRM_ACTIVITY_MAX_ATTEMPTS` | `20` |
 
@@ -120,6 +121,7 @@ Do not delete these files during incident response unless the retained events ha
 - `player.heartbeat`: periodic online-player heartbeat
 - `player.afk_changed`: emitted only when sampled AFK state changes
 - `player.stat_delta`: NeoForge XP change represented as `stat=minecraft:experience_points`, `delta=<amount>`
+- `player.stat_delta` (vanilla statistics): every `IVRM_ACTIVITY_STATS_SECONDS` and once more immediately before `player.logout`, the adapter snapshots the server player's statistics (blocks mined, items crafted, items used, entities killed and every custom statistic such as play time or distance walked) and emits only positive changes since the previous snapshot. The first snapshot after login only establishes the baseline and is never emitted, so pre-login history is not reported. `stat` uses the composite id `<stat type>/<value>` (for example `minecraft:mined/minecraft:iron_ore` or `minecraft:custom/minecraft:walk_one_cm`) and `delta` carries the increase in vanilla units (ticks for `play_time`, centimetres for distance statistics).
 
 The dispatcher remains active through final `PlayerLoggedOutEvent` handling. `ServerStoppedEvent` calls `ActivityRuntime.close()`, which closes new ingress, executes the synchronous ingress durability barrier, and only then interrupts/terminates the dispatcher. Shutdown does not wait for a potentially long HTTP request before making already-accepted ingress durable.
 

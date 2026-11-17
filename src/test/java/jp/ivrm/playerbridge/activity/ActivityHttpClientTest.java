@@ -165,6 +165,7 @@ final class ActivityHttpClientTest {
                 Duration.ofSeconds(2),
                 30,
                 300,
+                300,
                 100,
                 5,
                 state.resolve("queue.ndjson"),

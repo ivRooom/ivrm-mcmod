@@ -306,6 +306,7 @@ final class ActivityRuntimeTest {
                 Duration.ofSeconds(120),
                 30,
                 300,
+                300,
                 maxQueueEntries,
                 5,
                 state.resolve("queue.ndjson"),
