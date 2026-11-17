@@ -24,6 +24,7 @@ public final class ActivityConfig {
     private final Duration requestTimeout;
     private final int heartbeatSeconds;
     private final int afkThresholdSeconds;
+    private final int statsSeconds;
     private final int maxQueueEntries;
     private final int maxAttempts;
     private final Path queuePath;
@@ -40,6 +41,7 @@ public final class ActivityConfig {
             Duration requestTimeout,
             int heartbeatSeconds,
             int afkThresholdSeconds,
+            int statsSeconds,
             int maxQueueEntries,
             int maxAttempts,
             Path queuePath,
@@ -54,6 +56,7 @@ public final class ActivityConfig {
         this.requestTimeout = requestTimeout;
         this.heartbeatSeconds = heartbeatSeconds;
         this.afkThresholdSeconds = afkThresholdSeconds;
+        this.statsSeconds = statsSeconds;
         this.maxQueueEntries = maxQueueEntries;
         this.maxAttempts = maxAttempts;
         this.queuePath = queuePath;
@@ -89,6 +92,8 @@ public final class ActivityConfig {
                 "IVRM_ACTIVITY_HEARTBEAT_SECONDS", "ivrm.activity.heartbeatSeconds", 30, 5, 3600);
         int afkThresholdSeconds = intSetting(
                 "IVRM_ACTIVITY_AFK_SECONDS", "ivrm.activity.afkSeconds", 300, 30, 86400);
+        int statsSeconds = intSetting(
+                "IVRM_ACTIVITY_STATS_SECONDS", "ivrm.activity.statsSeconds", 300, 30, 3600);
         int maxQueueEntries = intSetting(
                 "IVRM_ACTIVITY_QUEUE_MAX", "ivrm.activity.queueMax", 10_000, 100, 1_000_000);
         int maxAttempts = intSetting(
@@ -105,6 +110,7 @@ public final class ActivityConfig {
                 Duration.ofSeconds(requestTimeoutSeconds),
                 heartbeatSeconds,
                 afkThresholdSeconds,
+                statsSeconds,
                 maxQueueEntries,
                 maxAttempts,
                 stateDir.resolve("queue.ndjson"),
@@ -208,6 +214,10 @@ public final class ActivityConfig {
         return afkThresholdSeconds;
     }
 
+    public int statsSeconds() {
+        return statsSeconds;
+    }
+
     public int maxQueueEntries() {
         return maxQueueEntries;
     }
@@ -236,6 +246,7 @@ public final class ActivityConfig {
                 + ", secretConfigured=" + !secret.isBlank()
                 + ", heartbeatSeconds=" + heartbeatSeconds
                 + ", afkThresholdSeconds=" + afkThresholdSeconds
+                + ", statsSeconds=" + statsSeconds
                 + ", maxQueueEntries=" + maxQueueEntries
                 + ", maxAttempts=" + maxAttempts;
     }
