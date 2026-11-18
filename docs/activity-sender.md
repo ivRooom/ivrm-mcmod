@@ -118,7 +118,7 @@ Do not delete these files during incident response unless the retained events ha
 
 - `player.login`: NeoForge `PlayerLoggedInEvent`
 - `player.logout`: NeoForge `PlayerLoggedOutEvent`
-- `player.heartbeat`: periodic online-player heartbeat
+- `player.heartbeat`: periodic online-player heartbeat. Attributes: `afk` (`"true"` / `"false"`), `world_game_time` (game time of the player's current level, in ticks) and `world_day` (whole in-game days elapsed in the world, `world_game_time / 24000`). The member dashboard derives the server's world day from the newest main-server heartbeat (#1315 B3), so no separate world-time event type exists.
 - `player.afk_changed`: emitted only when sampled AFK state changes
 - `player.stat_delta`: NeoForge XP change represented as `stat=minecraft:experience_points`, `delta=<amount>`
 - `player.stat_delta` (vanilla statistics): every `IVRM_ACTIVITY_STATS_SECONDS` and once more immediately before `player.logout`, the adapter snapshots the server player's statistics (blocks mined, items crafted, items used, entities killed and every custom statistic such as play time or distance walked) and emits only positive changes since the previous snapshot. The first snapshot after login only establishes the baseline and is never emitted, so pre-login history is not reported. `stat` uses the composite id `<stat type>/<value>` (for example `minecraft:mined/minecraft:iron_ore` or `minecraft:custom/minecraft:walk_one_cm`) and `delta` carries the increase in vanilla units (ticks for `play_time`, centimetres for distance statistics).
