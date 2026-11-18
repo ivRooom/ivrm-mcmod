@@ -100,7 +100,8 @@ public final class NeoForgeActivityEvents {
             if (Duration.between(state.lastHeartbeatAt, now).getSeconds()
                     >= runtime.config().heartbeatSeconds()) {
                 state.lastHeartbeatAt = now;
-                emit(player, "player.heartbeat", Map.of("afk", Boolean.toString(state.afk)));
+                emit(player, "player.heartbeat",
+                        WorldTime.heartbeatAttributes(state.afk, player.level().getGameTime()));
             }
 
             if (Duration.between(state.lastStatsFlushAt, now).getSeconds()
