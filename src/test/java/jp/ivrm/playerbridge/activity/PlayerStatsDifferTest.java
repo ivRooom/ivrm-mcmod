@@ -55,6 +55,24 @@ final class PlayerStatsDifferTest {
     }
 
     @Test
+    void lifecycleCategoriesFlowThroughTheDiffer() {
+        PlayerStatsDiffer differ = new PlayerStatsDiffer();
+        differ.diff(Map.of());
+
+        assertEquals(
+                List.of(
+                        new PlayerStatsDiffer.StatDelta("minecraft:broken/minecraft:iron_pickaxe", 1),
+                        new PlayerStatsDiffer.StatDelta("minecraft:dropped/minecraft:cobblestone", 12),
+                        new PlayerStatsDiffer.StatDelta("minecraft:killed_by/minecraft:zombie", 2),
+                        new PlayerStatsDiffer.StatDelta("minecraft:picked_up/minecraft:diamond", 5)),
+                differ.diff(Map.of(
+                        "minecraft:picked_up/minecraft:diamond", 5,
+                        "minecraft:killed_by/minecraft:zombie", 2,
+                        "minecraft:dropped/minecraft:cobblestone", 12,
+                        "minecraft:broken/minecraft:iron_pickaxe", 1)));
+    }
+
+    @Test
     void deltasAreOrderedByStatisticId() {
         PlayerStatsDiffer differ = new PlayerStatsDiffer();
         differ.diff(Map.of());

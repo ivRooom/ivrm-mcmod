@@ -27,7 +27,11 @@ public final class VanillaPlayerStats {
         collect(counter, Stats.BLOCK_MINED, totals);
         collect(counter, Stats.ITEM_CRAFTED, totals);
         collect(counter, Stats.ITEM_USED, totals);
+        collect(counter, Stats.ITEM_BROKEN, totals);
+        collect(counter, Stats.ITEM_PICKED_UP, totals);
+        collect(counter, Stats.ITEM_DROPPED, totals);
         collect(counter, Stats.ENTITY_KILLED, totals);
+        collect(counter, Stats.ENTITY_KILLED_BY, totals);
         collectCustom(counter, totals);
         return totals;
     }

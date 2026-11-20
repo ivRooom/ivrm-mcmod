@@ -9,6 +9,7 @@ import java.util.UUID;
 import net.minecraft.server.level.ServerPlayer;
 import net.neoforged.bus.api.EventPriority;
 import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.neoforge.event.entity.player.AdvancementEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerXpEvent;
 import net.neoforged.neoforge.event.server.ServerStoppedEvent;
@@ -71,6 +72,24 @@ public final class NeoForgeActivityEvents {
         emit(player, "player.stat_delta", Map.of(
                 "stat", "minecraft:experience_points",
                 "delta", Integer.toString(event.getAmount())));
+    }
+
+    /**
+     * Advancements are one-shot milestones, so they are emitted immediately
+     * as their own event type instead of through the statistics differ.
+     * Recipe unlock advancements are internal bookkeeping and are filtered
+     * out by {@link AdvancementAttributes}.
+     */
+    @SubscribeEvent
+    public void onAdvancementEarned(AdvancementEvent.AdvancementEarnEvent event) {
+        if (!(event.getEntity() instanceof ServerPlayer player) || !runtime.enabled()) {
+            return;
+        }
+        String advancementId = event.getAdvancement().id().toString();
+        if (!AdvancementAttributes.isReportable(advancementId)) {
+            return;
+        }
+        emit(player, "player.advancement", AdvancementAttributes.attributes(advancementId));
     }
 
     @SubscribeEvent
