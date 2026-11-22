@@ -3,10 +3,12 @@ package jp.ivrm.playerbridge;
 import com.mojang.logging.LogUtils;
 import jp.ivrm.playerbridge.activity.ActivityConfig;
 import jp.ivrm.playerbridge.activity.ActivityRuntime;
+import jp.ivrm.playerbridge.activity.FtbQuestsActivityEvents;
 import jp.ivrm.playerbridge.activity.NeoForgeActivityEvents;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.ModContainer;
+import net.neoforged.fml.ModList;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.loading.FMLPaths;
 import net.neoforged.neoforge.common.NeoForge;
@@ -39,6 +41,7 @@ public final class IvrmPlayerBridge {
 
             ActivityRuntime runtime = new ActivityRuntime(config, LOGGER);
             NeoForge.EVENT_BUS.register(new NeoForgeActivityEvents(runtime));
+            registerFtbQuestsHook(runtime);
             runtime.start();
         } catch (RuntimeException exception) {
             // Activity reporting must never prevent the Minecraft server from starting.
@@ -47,6 +50,29 @@ public final class IvrmPlayerBridge {
             LOGGER.error(
                     "IVRM Activity sender could not initialize and remains disabled: reasonType={}",
                     exception.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * FTB Quests completion hook (quest sync S2, ivrm-web #1608).
+     * The listener class references FTB Quests API types, so it is
+     * only touched when the mod is actually loaded; a linkage or
+     * API problem must degrade to "no FTB events" and never take
+     * the canonical sender (or the server) down, hence Throwable.
+     * Only the exception type is logged, as above.
+     */
+    private static void registerFtbQuestsHook(ActivityRuntime runtime) {
+        if (!ModList.get().isLoaded("ftbquests")) {
+            LOGGER.info("FTB Quests not loaded; quest completion events are disabled");
+            return;
+        }
+        try {
+            FtbQuestsActivityEvents.register(runtime);
+            LOGGER.info("FTB Quests completion hook registered");
+        } catch (Throwable throwable) {
+            LOGGER.error(
+                    "FTB Quests completion hook could not register and remains disabled: reasonType={}",
+                    throwable.getClass().getSimpleName());
         }
     }
 }

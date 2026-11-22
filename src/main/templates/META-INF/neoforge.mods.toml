@@ -24,3 +24,10 @@ type="required"
 versionRange="${minecraft_version_range}"
 ordering="NONE"
 side="SERVER"
+
+[[dependencies.${mod_id}]]
+modId="ftbquests"
+type="optional"
+versionRange="[26.1.2.2,)"
+ordering="AFTER"
+side="SERVER"
