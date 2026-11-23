@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
@@ -21,7 +22,7 @@ final class EffectTextTest {
                 type,
                 new PresentationEvent.Payload(
                         "mc:daily:mine", "鉱石を掘る", periodType, "2026-11-23", xp, points,
-                        null, null, null, null, profile),
+                        null, null, null, null, profile, null, null, null),
                 CREATED,
                 EXPIRES);
     }
@@ -33,7 +34,20 @@ final class EffectTextTest {
                 "achievement_unlocked",
                 new PresentationEvent.Payload(
                         null, null, null, null, 10, null,
-                        "mining-100", "鉱夫見習い", "bronze", "1", profile),
+                        "mining-100", "鉱夫見習い", "bronze", "1", profile, null, null, null),
+                CREATED,
+                EXPIRES);
+    }
+
+    private static PresentationEvent loginBonus(String date, Integer xp, Integer totalXp) {
+        return new PresentationEvent(
+                "evt-3",
+                PLAYER,
+                "login_bonus",
+                new PresentationEvent.Payload(
+                        null, null, null, null, null, null,
+                        null, null, null, null, null,
+                        xp, date, totalXp),
                 CREATED,
                 EXPIRES);
     }
@@ -109,5 +123,56 @@ final class EffectTextTest {
         EffectText.RenderPlan plan = EffectText.planCatchUp(quest("weekly", "grand", null, 5), true);
         assertEquals(EffectText.Presentation.CHAT_ONLY, plan.presentation());
         assertEquals(EffectText.SoundProfile.NONE, plan.sound());
+    }
+
+    @Test
+    void todaysLoginBonusIsAnActionBarWithJingleAndSparkles() {
+        LocalDate today = LocalDate.of(2026, 11, 24);
+        EffectText.RenderPlan plan = EffectText.planLoginBonus(loginBonus("2026-11-24", 20, 1540), true, today);
+        assertEquals(EffectText.Presentation.ACTION_BAR, plan.presentation());
+        assertEquals("ログインボーナス +20 XP", plan.actionBarText());
+        assertEquals(EffectText.SoundProfile.LOGIN_BONUS, plan.sound());
+        assertEquals(EffectText.ParticleProfile.LOGIN_BONUS, plan.particles());
+        assertEquals(1, plan.chatLines().size());
+        assertEquals("ログインボーナス +20 XP を受け取りました！（現在の合計 XP: 1540）", plan.chatLines().get(0));
+    }
+
+    @Test
+    void loginBonusWithoutTotalOmitsTheSuffix() {
+        LocalDate today = LocalDate.of(2026, 11, 24);
+        EffectText.RenderPlan plan = EffectText.planLoginBonus(loginBonus("2026-11-24", 20, null), true, today);
+        assertEquals(EffectText.Presentation.ACTION_BAR, plan.presentation());
+        assertEquals("ログインボーナス +20 XP を受け取りました！", plan.chatLines().get(0));
+    }
+
+    @Test
+    void staleLoginBonusIsChatOnly() {
+        LocalDate today = LocalDate.of(2026, 11, 24);
+        EffectText.RenderPlan plan = EffectText.planLoginBonus(loginBonus("2026-11-23", 20, 1540), true, today);
+        assertEquals(EffectText.Presentation.CHAT_ONLY, plan.presentation());
+        assertNull(plan.actionBarText());
+        assertEquals(EffectText.SoundProfile.NONE, plan.sound());
+        assertEquals(EffectText.ParticleProfile.NONE, plan.particles());
+        assertEquals(1, plan.chatLines().size());
+        assertTrue(plan.chatLines().get(0).contains("ログインボーナス +20 XP"));
+    }
+
+    @Test
+    void loginBonusWithEffectsOffIsChatOnly() {
+        LocalDate today = LocalDate.of(2026, 11, 24);
+        EffectText.RenderPlan plan = EffectText.planLoginBonus(loginBonus("2026-11-24", 20, 1540), false, today);
+        assertEquals(EffectText.Presentation.CHAT_ONLY, plan.presentation());
+        assertEquals(EffectText.SoundProfile.NONE, plan.sound());
+        assertEquals(EffectText.ParticleProfile.NONE, plan.particles());
+        assertEquals(1, plan.chatLines().size());
+    }
+
+    @Test
+    void loginBonusWithUnreadableDateIsChatOnly() {
+        LocalDate today = LocalDate.of(2026, 11, 24);
+        EffectText.RenderPlan missing = EffectText.planLoginBonus(loginBonus(null, 20, null), true, today);
+        assertEquals(EffectText.Presentation.CHAT_ONLY, missing.presentation());
+        EffectText.RenderPlan garbled = EffectText.planLoginBonus(loginBonus("24/11/2026", 20, null), true, today);
+        assertEquals(EffectText.Presentation.CHAT_ONLY, garbled.presentation());
     }
 }

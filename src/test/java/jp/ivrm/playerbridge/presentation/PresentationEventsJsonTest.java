@@ -101,6 +101,49 @@ final class PresentationEventsJsonTest {
     }
 
     @Test
+    void parsesLoginBonusEvents() {
+        String json = """
+                {
+                  "generatedAt": "2026-11-24T00:01:00.000Z",
+                  "serverRole": "main",
+                  "events": [
+                    {
+                      "eventId": "mcpe_bonus_1",
+                      "uuid": "%s",
+                      "eventType": "login_bonus",
+                      "payload": {"xp": 20, "date": "2026-11-24", "totalXp": 1540},
+                      "createdAt": "2026-11-23T15:00:30.000Z",
+                      "expiresAt": "2026-11-24T15:00:00.000Z"
+                    },
+                    {
+                      "eventId": "mcpe_bonus_2",
+                      "uuid": "%s",
+                      "eventType": "login_bonus",
+                      "payload": {"xp": 20, "date": "2026-11-24"},
+                      "createdAt": "2026-11-23T15:00:30.000Z",
+                      "expiresAt": "2026-11-24T15:00:00.000Z"
+                    }
+                  ]
+                }
+                """.formatted(PLAYER, PLAYER);
+
+        List<PresentationEvent> events = PresentationJson.parseEvents(json);
+        assertEquals(2, events.size());
+
+        PresentationEvent bonus = events.get(0);
+        assertEquals("login_bonus", bonus.eventType());
+        assertTrue(bonus.isLoginBonus());
+        assertEquals(Integer.valueOf(20), bonus.payload().xp());
+        assertEquals("2026-11-24", bonus.payload().date());
+        assertEquals(Integer.valueOf(1540), bonus.payload().totalXp());
+        assertNull(bonus.payload().xpReward());
+
+        PresentationEvent noTotal = events.get(1);
+        assertTrue(noTotal.isLoginBonus());
+        assertNull(noTotal.payload().totalXp());
+    }
+
+    @Test
     void missingOptionalPayloadFieldsParseAsNull() {
         String json = """
                 {

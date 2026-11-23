@@ -191,7 +191,10 @@ public final class PresentationJson {
                 optionalString(object, "name"),
                 optionalString(object, "rank"),
                 optionalString(object, "tier"),
-                optionalString(object, "effectProfile"));
+                optionalString(object, "effectProfile"),
+                optionalInt(object, "xp"),
+                optionalString(object, "date"),
+                optionalInt(object, "totalXp"));
     }
 
     private static String optionalString(JsonObject object, String field) {

@@ -116,6 +116,8 @@ the achiever only**:
 | Weekly / monthly quest completed | ActionBar + chat, level-up sound, a few particles |
 | All-clear | Title + subtitle, challenge sound, firework particles |
 | Achievement unlocked | Title + subtitle; sound/particles graded by the API's effect profile (`celebration` / `grand`) |
+| Login bonus, granted for today (JST) | ActionBar + chat, level-up sound (volume 0.7), happy-villager particles |
+| Login bonus, granted for a previous day | Chat only |
 
 Delivery is at-least-once end to end and made exactly-once in
 practice by two acks: after rendering, the bridge records the
@@ -130,6 +132,13 @@ achievements as one simplified Title each, quest completions
 as chat summary lines only. Events whose presentation window
 (`expiresAt`: end of the quest period, 7 days for unlocks) has
 closed are never rendered; the API sweeps them to expired.
+
+Login bonuses (#1712) follow their own grading: the payload's
+`date` is the JST stat date the bonus was granted for. While
+that date is still today (JST) the bonus renders in full
+whenever the player receives it — even at a later same-day
+login; once the date has rolled over, the delivery is the
+chat record only, mirroring the catch-up rule.
 
 While `IVRM_PRESENTATION_EFFECTS_ENABLED` is off, or for a
 player who ran `/ivrm effects off`, events still produce their
