@@ -5,6 +5,11 @@ import jp.ivrm.playerbridge.activity.ActivityConfig;
 import jp.ivrm.playerbridge.activity.ActivityRuntime;
 import jp.ivrm.playerbridge.activity.FtbQuestsActivityEvents;
 import jp.ivrm.playerbridge.activity.NeoForgeActivityEvents;
+import jp.ivrm.playerbridge.presentation.BoardPreferences;
+import jp.ivrm.playerbridge.presentation.NeoForgePresentation;
+import jp.ivrm.playerbridge.presentation.PresentationCache;
+import jp.ivrm.playerbridge.presentation.PresentationConfig;
+import jp.ivrm.playerbridge.presentation.PresentationRuntime;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.ModContainer;
@@ -29,6 +34,7 @@ public final class IvrmPlayerBridge {
     public IvrmPlayerBridge(IEventBus modEventBus, ModContainer modContainer) {
         LOGGER.info("IVRM Player Bridge initialized (server-only foundation)");
         initializeActivitySender();
+        initializePresentation();
     }
 
     private static void initializeActivitySender() {
@@ -49,6 +55,44 @@ public final class IvrmPlayerBridge {
             // contain operator-supplied values and therefore potentially credentials.
             LOGGER.error(
                     "IVRM Activity sender could not initialize and remains disabled: reasonType={}",
+                    exception.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Presentation module (#1584 S3): snapshot polling, the
+     * per-player sidebar and {@code /ivrm today} / {@code /ivrm board}.
+     *
+     * <p>Independent of the Activity sender's enable flag — it
+     * reuses the sender's server identity (the API authorizes the
+     * snapshot with the same per-server secret) but has its own
+     * {@code IVRM_PRESENTATION_ENABLED} flag, default off. As with
+     * the sender, any initialization failure only disables this
+     * module and is logged by exception type, never by message.</p>
+     */
+    private static void initializePresentation() {
+        try {
+            java.nio.file.Path gameDir = FMLPaths.GAMEDIR.get();
+            PresentationConfig config = PresentationConfig.load(gameDir);
+            if (!config.enabled()) {
+                LOGGER.info("IVRM Presentation module is disabled: {}", config.summary());
+                return;
+            }
+            ActivityConfig identity = ActivityConfig.load(gameDir);
+            if (identity.serverId().isBlank() || identity.secret().isBlank()) {
+                throw new IllegalArgumentException(
+                        "IVRM_ACTIVITY_SERVER_ID and IVRM_ACTIVITY_SERVER_SECRET are required"
+                                + " when the presentation module is enabled");
+            }
+
+            PresentationCache cache = new PresentationCache();
+            PresentationRuntime runtime = new PresentationRuntime(identity, config, cache, LOGGER);
+            BoardPreferences preferences = new BoardPreferences(config.boardPreferencesPath(), LOGGER);
+            NeoForge.EVENT_BUS.register(new NeoForgePresentation(runtime, cache, preferences, identity, LOGGER));
+            runtime.start();
+        } catch (RuntimeException exception) {
+            LOGGER.error(
+                    "IVRM Presentation module could not initialize and remains disabled: reasonType={}",
                     exception.getClass().getSimpleName());
         }
     }
