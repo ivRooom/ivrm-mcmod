@@ -33,6 +33,8 @@ import jp.ivrm.playerbridge.presentation.PresentationSnapshot.Snapshot;
 public final class PresentationHttpClient {
     public static final String METHOD = "POST";
     public static final String PATH = "/v1/minecraft/presentation/snapshot";
+    public static final String EVENTS_PATH = "/v1/minecraft/presentation/events";
+    public static final String EVENTS_ACK_PATH = "/v1/minecraft/presentation/events/ack";
 
     public sealed interface FetchResult {
         record Success(Snapshot snapshot) implements FetchResult {
@@ -40,6 +42,24 @@ public final class PresentationHttpClient {
 
         /** @param statusCode HTTP status, or -1 when no response was received */
         record Failure(int statusCode, String reason) implements FetchResult {
+        }
+    }
+
+    public sealed interface EventsResult {
+        record Success(List<PresentationEvent> events) implements EventsResult {
+        }
+
+        /** @param statusCode HTTP status, or -1 when no response was received */
+        record Failure(int statusCode, String reason) implements EventsResult {
+        }
+    }
+
+    public sealed interface AckResult {
+        record Success(int acknowledged) implements AckResult {
+        }
+
+        /** @param statusCode HTTP status, or -1 when no response was received */
+        record Failure(int statusCode, String reason) implements AckResult {
         }
     }
 
@@ -61,10 +81,72 @@ public final class PresentationHttpClient {
 
     public FetchResult fetch(List<PlayerRef> players) {
         String body = PresentationJson.buildRequestBody(identity.serverRole(), players);
+        HttpResult result = post(PATH, body);
+        if (result instanceof HttpResult.Failure failure) {
+            return new FetchResult.Failure(failure.statusCode(), failure.reason());
+        }
+        String responseBody = ((HttpResult.Success) result).body();
+        try {
+            return new FetchResult.Success(PresentationJson.parseSnapshot(responseBody));
+        } catch (IllegalArgumentException exception) {
+            return new FetchResult.Failure(200, "unparsable snapshot body");
+        }
+    }
+
+    /** Polls the Presentation Outbox for pending effect events (S4). */
+    public EventsResult fetchEvents() {
+        String body = PresentationJson.buildEventsRequestBody(identity.serverRole());
+        HttpResult result = post(EVENTS_PATH, body);
+        if (result instanceof HttpResult.Failure failure) {
+            return new EventsResult.Failure(failure.statusCode(), failure.reason());
+        }
+        String responseBody = ((HttpResult.Success) result).body();
+        try {
+            return new EventsResult.Success(PresentationJson.parseEvents(responseBody));
+        } catch (IllegalArgumentException exception) {
+            return new EventsResult.Failure(200, "unparsable events body");
+        }
+    }
+
+    /** Acks rendered events so the API marks them delivered (S4). */
+    public AckResult ackEvents(List<String> eventIds) {
+        String body = PresentationJson.buildAckRequestBody(identity.serverRole(), eventIds);
+        HttpResult result = post(EVENTS_ACK_PATH, body);
+        if (result instanceof HttpResult.Failure failure) {
+            return new AckResult.Failure(failure.statusCode(), failure.reason());
+        }
+        String responseBody = ((HttpResult.Success) result).body();
+        try {
+            com.google.gson.JsonObject root =
+                    com.google.gson.JsonParser.parseString(responseBody).getAsJsonObject();
+            int acknowledged = root.has("acknowledged")
+                    ? root.get("acknowledged").getAsInt()
+                    : eventIds.size();
+            return new AckResult.Success(acknowledged);
+        } catch (RuntimeException exception) {
+            return new AckResult.Failure(200, "unparsable ack body");
+        }
+    }
+
+    private sealed interface HttpResult {
+        record Success(String body) implements HttpResult {
+        }
+
+        record Failure(int statusCode, String reason) implements HttpResult {
+        }
+    }
+
+    /**
+     * One signed POST in the activity ingest's wire format. The
+     * event id is a fresh per-request UUID because these
+     * endpoints store no request identity (delivery identity
+     * lives in the outbox event ids themselves).
+     */
+    private HttpResult post(String path, String body) {
         String timestamp = Instant.now(clock).toString();
         String eventId = UUID.randomUUID().toString();
-        String signature = ActivitySigner.sign(identity.secret(), METHOD, PATH, timestamp, eventId, body);
-        URI endpoint = identity.baseUri().resolve(PATH);
+        String signature = ActivitySigner.sign(identity.secret(), METHOD, path, timestamp, eventId, body);
+        URI endpoint = identity.baseUri().resolve(path);
 
         HttpRequest request = HttpRequest.newBuilder(endpoint)
                 .timeout(identity.requestTimeout())
@@ -80,21 +162,17 @@ public final class PresentationHttpClient {
         try {
             response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         } catch (IOException exception) {
-            return new FetchResult.Failure(-1, "transport error: " + exception.getClass().getSimpleName());
+            return new HttpResult.Failure(-1, "transport error: " + exception.getClass().getSimpleName());
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            return new FetchResult.Failure(-1, "interrupted");
+            return new HttpResult.Failure(-1, "interrupted");
         }
 
         int statusCode = response.statusCode();
         if (statusCode != 200) {
             // The body is an error code only; never log or surface it.
-            return new FetchResult.Failure(statusCode, "unexpected HTTP status");
+            return new HttpResult.Failure(statusCode, "unexpected HTTP status");
         }
-        try {
-            return new FetchResult.Success(PresentationJson.parseSnapshot(response.body()));
-        } catch (IllegalArgumentException exception) {
-            return new FetchResult.Failure(statusCode, "unparsable snapshot body");
-        }
+        return new HttpResult.Success(response.body());
     }
 }

@@ -127,6 +127,89 @@ public final class PresentationJson {
                 next);
     }
 
+    public static String buildEventsRequestBody(String serverRole) {
+        JsonObject root = new JsonObject();
+        root.addProperty("schemaVersion", 1);
+        root.addProperty("serverRole", serverRole);
+        return root.toString();
+    }
+
+    public static String buildAckRequestBody(String serverRole, List<String> eventIds) {
+        JsonObject root = new JsonObject();
+        root.addProperty("schemaVersion", 1);
+        root.addProperty("serverRole", serverRole);
+        JsonArray ids = new JsonArray();
+        for (String eventId : eventIds) {
+            ids.add(eventId);
+        }
+        root.add("eventIds", ids);
+        return root.toString();
+    }
+
+    /**
+     * Parses the outbox poll response (#1584 S4). Strict on the
+     * envelope and the fields the renderer keys on (event id,
+     * player uuid, type, timestamps); the payload itself is
+     * parsed leniently — a missing display field degrades the
+     * wording, never the delivery bookkeeping.
+     */
+    public static List<PresentationEvent> parseEvents(String body) {
+        JsonElement parsed;
+        try {
+            parsed = JsonParser.parseString(body);
+        } catch (RuntimeException exception) {
+            throw new IllegalArgumentException("Presentation events are not valid JSON", exception);
+        }
+        JsonObject root = requireObject(parsed, "events response");
+        List<PresentationEvent> events = new ArrayList<>();
+        for (JsonElement element : requireArray(root, "events")) {
+            JsonObject object = requireObject(element, "event");
+            events.add(new PresentationEvent(
+                    requireString(object, "eventId"),
+                    requireUuid(object, "uuid"),
+                    requireString(object, "eventType"),
+                    parsePayload(object.get("payload")),
+                    requireInstant(object, "createdAt"),
+                    requireInstant(object, "expiresAt")));
+        }
+        return events;
+    }
+
+    private static PresentationEvent.Payload parsePayload(JsonElement element) {
+        if (element == null || !element.isJsonObject()) {
+            return PresentationEvent.Payload.empty();
+        }
+        JsonObject object = element.getAsJsonObject();
+        return new PresentationEvent.Payload(
+                optionalString(object, "questKey"),
+                optionalString(object, "title"),
+                optionalString(object, "periodType"),
+                optionalString(object, "periodKey"),
+                optionalInt(object, "xpReward"),
+                optionalInt(object, "pointsAmount"),
+                optionalString(object, "code"),
+                optionalString(object, "name"),
+                optionalString(object, "rank"),
+                optionalString(object, "tier"),
+                optionalString(object, "effectProfile"));
+    }
+
+    private static String optionalString(JsonObject object, String field) {
+        JsonElement element = object.get(field);
+        if (element == null || !element.isJsonPrimitive() || !element.getAsJsonPrimitive().isString()) {
+            return null;
+        }
+        return element.getAsString();
+    }
+
+    private static Integer optionalInt(JsonObject object, String field) {
+        JsonElement element = object.get(field);
+        if (element == null || !element.isJsonPrimitive() || !element.getAsJsonPrimitive().isNumber()) {
+            return null;
+        }
+        return element.getAsInt();
+    }
+
     private static JsonObject requireObject(JsonElement element, String what) {
         if (element == null || !element.isJsonObject()) {
             throw new IllegalArgumentException(what + " must be a JSON object");

@@ -3,27 +3,43 @@ package jp.ivrm.playerbridge.presentation;
 import com.mojang.brigadier.context.CommandContext;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import jp.ivrm.playerbridge.activity.ActivityConfig;
 import jp.ivrm.playerbridge.activity.WorldTime;
+import jp.ivrm.playerbridge.presentation.EffectText.RenderPlan;
 import jp.ivrm.playerbridge.presentation.PresentationSnapshot.PlayerEntry;
 import jp.ivrm.playerbridge.presentation.PresentationSnapshot.PlayerRef;
 import jp.ivrm.playerbridge.presentation.SidebarLines.LocalInfo;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
+import net.minecraft.core.Holder;
+import net.minecraft.core.particles.ParticleOptions;
+import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.numbers.BlankFormat;
+import net.minecraft.network.protocol.game.ClientboundLevelParticlesPacket;
 import net.minecraft.network.protocol.game.ClientboundResetScorePacket;
 import net.minecraft.network.protocol.game.ClientboundSetDisplayObjectivePacket;
 import net.minecraft.network.protocol.game.ClientboundSetObjectivePacket;
 import net.minecraft.network.protocol.game.ClientboundSetScorePacket;
+import net.minecraft.network.protocol.game.ClientboundSetSubtitleTextPacket;
+import net.minecraft.network.protocol.game.ClientboundSetTitleTextPacket;
+import net.minecraft.network.protocol.game.ClientboundSetTitlesAnimationPacket;
+import net.minecraft.network.protocol.game.ClientboundSoundPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
@@ -49,22 +65,38 @@ import org.slf4j.Logger;
  *
  * <p>Commands: {@code /ivrm today} prints the full daily /
  * achievement summary to the player's own chat;
- * {@code /ivrm board on|off} toggles the sidebar persistently.
- * Achievement effects are S4 and intentionally not here.</p>
+ * {@code /ivrm board on|off} toggles the sidebar persistently;
+ * {@code /ivrm effects on|off} toggles the S4 achievement
+ * effects (Title / sound / particles) persistently — the chat
+ * completion record still arrives while effects are off.</p>
+ *
+ * <p>S4 effects: the runtime polls the Presentation Outbox;
+ * this adapter renders each event once for its player only
+ * (ActionBar for a normal completion, Title + sound + particles
+ * for an all-clear or an unlock), spaced at least 2 seconds per
+ * player, then records it in the local delivered ledger and
+ * queues the ack. Events that completed while the player was
+ * offline are delivered as login catch-up: achievements get one
+ * simplified Title, quest completions fold into chat only.</p>
  */
 public final class NeoForgePresentation {
     static final String OBJECTIVE_NAME = "ivrm_sidebar";
     private static final int RENDER_SAMPLE_TICKS = 20;
+    private static final Duration EFFECT_SPACING = Duration.ofSeconds(2);
     private static final double POSITION_EPSILON = 0.0001D;
     private static final float ROTATION_EPSILON = 0.01F;
 
     private final PresentationRuntime runtime;
     private final PresentationCache cache;
     private final BoardPreferences preferences;
+    private final EffectsPreferences effectsPreferences;
+    private final DeliveredEventsLedger deliveredLedger;
     private final ActivityConfig identity;
     private final Logger logger;
     private final Objective objective;
     private final Map<UUID, RenderState> players = new HashMap<>();
+    private final Map<UUID, List<PresentationEvent>> heldEvents = new HashMap<>();
+    private final Set<String> seenEventIds = new HashSet<>();
     private volatile List<PlayerRef> onlineRefs = List.of();
     private int tickCounter;
 
@@ -72,11 +104,15 @@ public final class NeoForgePresentation {
             PresentationRuntime runtime,
             PresentationCache cache,
             BoardPreferences preferences,
+            EffectsPreferences effectsPreferences,
+            DeliveredEventsLedger deliveredLedger,
             ActivityConfig identity,
             Logger logger) {
         this.runtime = runtime;
         this.cache = cache;
         this.preferences = preferences;
+        this.effectsPreferences = effectsPreferences;
+        this.deliveredLedger = deliveredLedger;
         this.identity = identity;
         this.logger = logger;
         this.objective = new Objective(
@@ -97,7 +133,10 @@ public final class NeoForgePresentation {
                         .then(Commands.literal("today").executes(this::runToday))
                         .then(Commands.literal("board")
                                 .then(Commands.literal("on").executes(context -> runBoard(context, true)))
-                                .then(Commands.literal("off").executes(context -> runBoard(context, false)))));
+                                .then(Commands.literal("off").executes(context -> runBoard(context, false))))
+                        .then(Commands.literal("effects")
+                                .then(Commands.literal("on").executes(context -> runEffects(context, true)))
+                                .then(Commands.literal("off").executes(context -> runEffects(context, false)))));
     }
 
     @SubscribeEvent
@@ -118,6 +157,8 @@ public final class NeoForgePresentation {
         if (state != null) {
             removeSidebar(player, state);
         }
+        // Held (not yet rendered) events stay in heldEvents: if
+        // the player returns, they are delivered as catch-up.
     }
 
     @SubscribeEvent
@@ -163,12 +204,16 @@ public final class NeoForgePresentation {
                     local, entry, usable, resetsAt.orElse(null), now);
             applyLines(player, state, lines);
         }
+
+        processEvents(online, now);
     }
 
     @SubscribeEvent
     public void onServerStopped(ServerStoppedEvent event) {
         runtime.close();
         players.clear();
+        heldEvents.clear();
+        seenEventIds.clear();
     }
 
     private void updateOnlineRefs(List<ServerPlayer> online) {
@@ -235,6 +280,177 @@ public final class NeoForgePresentation {
                         : "[IVRM] サイドバーを非表示にしました（/ivrm board on で再表示できます）"),
                 false);
         return 1;
+    }
+
+    private int runEffects(CommandContext<CommandSourceStack> context, boolean enabled) {
+        CommandSourceStack source = context.getSource();
+        if (!(source.getEntity() instanceof ServerPlayer player)) {
+            source.sendFailure(Component.literal("[IVRM] このコマンドはプレイヤーだけが使えます"));
+            return 0;
+        }
+        effectsPreferences.setEffectsEnabled(player.getUUID(), enabled);
+        source.sendSuccess(
+                () -> Component.literal(enabled
+                        ? "[IVRM] 達成演出を表示します"
+                        : "[IVRM] 達成演出を止めました（完了のチャット記録は届きます。/ivrm effects on で再開できます）"),
+                false);
+        return 1;
+    }
+
+    // ------------------------------------------------------------------
+    // S4: outbox effect delivery
+    // ------------------------------------------------------------------
+
+    /**
+     * Moves freshly polled events into per-player queues and
+     * renders at most one queued effect per player per sampling
+     * tick, spaced by {@link #EFFECT_SPACING}. Runs on the server
+     * thread; all HTTP stays in the runtime.
+     */
+    private void processEvents(List<ServerPlayer> online, Instant now) {
+        for (PresentationEvent event : runtime.drainEvents()) {
+            if (!seenEventIds.add(event.eventId())) {
+                continue;
+            }
+            if (deliveredLedger.isHandled(event.eventId())) {
+                // Rendered before but the ack never landed; ack
+                // again so the API stops returning it.
+                runtime.queueAcks(List.of(event.eventId()));
+                continue;
+            }
+            if (!event.expiresAt().isAfter(now)) {
+                // The presentation window closed between the poll
+                // and this tick. Never render expired events; the
+                // API sweeps the row to expired on its side.
+                continue;
+            }
+            heldEvents.computeIfAbsent(event.uuid(), ignored -> new ArrayList<>()).add(event);
+        }
+
+        Map<UUID, ServerPlayer> onlineByUuid = new HashMap<>();
+        for (ServerPlayer player : online) {
+            onlineByUuid.put(player.getUUID(), player);
+        }
+        // Drop held events whose window closed while waiting.
+        heldEvents.values().forEach(list -> list.removeIf(event -> !event.expiresAt().isAfter(now)));
+
+        for (ServerPlayer player : online) {
+            RenderState state = players.get(player.getUUID());
+            if (state == null) {
+                continue;
+            }
+            List<PresentationEvent> held = heldEvents.remove(player.getUUID());
+            if (held != null) {
+                boolean effectsOn = runtime.config().effectsEnabled()
+                        && effectsPreferences.effectsEnabled(player.getUUID());
+                for (PresentationEvent event : held) {
+                    boolean catchUp = event.createdAt().isBefore(state.loggedInAt);
+                    RenderPlan plan = catchUp
+                            ? EffectText.planCatchUp(event, effectsOn)
+                            : EffectText.planLive(event, effectsOn);
+                    state.effectQueue.addLast(new QueuedEffect(event.eventId(), plan));
+                }
+            }
+            QueuedEffect next = state.effectQueue.peekFirst();
+            if (next != null && !now.isBefore(state.nextEffectAt)) {
+                state.effectQueue.pollFirst();
+                executePlan(player, next.plan());
+                deliveredLedger.markHandled(next.eventId(), now);
+                runtime.queueAcks(List.of(next.eventId()));
+                state.nextEffectAt = now.plus(EFFECT_SPACING);
+            }
+        }
+    }
+
+    private void executePlan(ServerPlayer player, RenderPlan plan) {
+        try {
+            for (String line : plan.chatLines()) {
+                player.sendSystemMessage(Component.literal(line));
+            }
+            switch (plan.presentation()) {
+                case ACTION_BAR -> {
+                    if (plan.actionBarText() != null) {
+                        player.sendSystemMessage(Component.literal(plan.actionBarText()), true);
+                    }
+                }
+                case TITLE -> {
+                    player.connection.send(new ClientboundSetTitlesAnimationPacket(10, 70, 20));
+                    player.connection.send(new ClientboundSetSubtitleTextPacket(
+                            Component.literal(plan.subtitleText() == null ? "" : plan.subtitleText())));
+                    player.connection.send(new ClientboundSetTitleTextPacket(
+                            Component.literal(plan.titleText() == null ? "" : plan.titleText())));
+                }
+                case CHAT_ONLY -> {
+                    // Chat lines above are the whole delivery.
+                }
+            }
+            playSound(player, plan.sound());
+            spawnParticles(player, plan.particles());
+        } catch (RuntimeException exception) {
+            // A disconnect racing the tick must not break delivery
+            // for everyone else; the event is still acked so a
+            // reconnect does not replay a stale effect.
+            logger.warn(
+                    "IVRM effect render failed for a player: reasonType={}",
+                    exception.getClass().getSimpleName());
+        }
+    }
+
+    private void playSound(ServerPlayer player, EffectText.SoundProfile profile) {
+        SoundEvent sound = switch (profile) {
+            case NONE -> null;
+            case SMALL -> SoundEvents.EXPERIENCE_ORB_PICKUP;
+            case LEVELUP -> SoundEvents.PLAYER_LEVELUP;
+            case CHALLENGE -> SoundEvents.UI_TOAST_CHALLENGE_COMPLETE;
+        };
+        if (sound == null) {
+            return;
+        }
+        player.connection.send(new ClientboundSoundPacket(
+                Holder.direct(sound),
+                SoundSource.MASTER,
+                player.getX(),
+                player.getY(),
+                player.getZ(),
+                1.0F,
+                1.0F,
+                0L));
+    }
+
+    private void spawnParticles(ServerPlayer player, EffectText.ParticleProfile profile) {
+        ParticleOptions particle;
+        int count;
+        switch (profile) {
+            case NONE -> {
+                return;
+            }
+            case SMALL -> {
+                particle = ParticleTypes.HAPPY_VILLAGER;
+                count = 8;
+            }
+            case FIREWORK -> {
+                particle = ParticleTypes.FIREWORK;
+                count = 16;
+            }
+            default -> {
+                return;
+            }
+        }
+        player.connection.send(new ClientboundLevelParticlesPacket(
+                particle,
+                false,
+                true,
+                player.getX(),
+                player.getY() + 1.0D,
+                player.getZ(),
+                0.5F,
+                0.5F,
+                0.5F,
+                0.02F,
+                count));
+    }
+
+    private record QueuedEffect(String eventId, RenderPlan plan) {
     }
 
     private void applyLines(ServerPlayer player, RenderState state, List<String> lines) {
@@ -310,6 +526,9 @@ public final class NeoForgePresentation {
         private float pitch;
         private Instant lastActiveAt;
         private boolean afk;
+        private Instant loggedInAt;
+        private final Deque<QueuedEffect> effectQueue = new ArrayDeque<>();
+        private Instant nextEffectAt = Instant.EPOCH;
 
         static RenderState from(ServerPlayer player, Instant now) {
             RenderState state = new RenderState();
@@ -319,6 +538,7 @@ public final class NeoForgePresentation {
             state.yaw = player.getYRot();
             state.pitch = player.getXRot();
             state.lastActiveAt = now;
+            state.loggedInAt = now;
             return state;
         }
 
