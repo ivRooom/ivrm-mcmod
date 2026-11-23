@@ -1,5 +1,7 @@
 package jp.ivrm.playerbridge.presentation;
 
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.List;
 import jp.ivrm.playerbridge.presentation.PresentationEvent.Payload;
@@ -20,6 +22,11 @@ import jp.ivrm.playerbridge.presentation.PresentationEvent.Payload;
  *   <li>Offline catch-up: achievements get one simplified Title
  *   on the next login; quest completions never get a Title
  *   retroactively — they fold into a login chat summary.</li>
+ *   <li>A login bonus is graded by its JST stat date, not by
+ *   the login moment: today's bonus gets the full treatment
+ *   (ActionBar + level-up sound + particles) whenever the
+ *   player receives it, while a bonus for a previous day is a
+ *   chat record only — the same idea as the catch-up rule.</li>
  *   <li>With effects off (globally or per player), the chat
  *   record still arrives; only the overlay / sound / particles
  *   are skipped.</li>
@@ -39,13 +46,17 @@ public final class EffectText {
         NONE,
         SMALL,
         LEVELUP,
-        CHALLENGE
+        CHALLENGE,
+        /** Player level-up jingle at a softer volume (login bonus). */
+        LOGIN_BONUS
     }
 
     public enum ParticleProfile {
         NONE,
         SMALL,
-        FIREWORK
+        FIREWORK,
+        /** A ring of happy-villager sparkles (login bonus). */
+        LOGIN_BONUS
     }
 
     public record RenderPlan(
@@ -144,6 +155,54 @@ public final class EffectText {
         chat.add("[IVRM] オフライン中に完了: " + missionWord(payload.periodType()) + "「"
                 + title(payload) + "」（+" + amount(payload.xpReward()) + " XP）");
         return chatOnly(chat);
+    }
+
+    /**
+     * Login bonus (ivrm-web #1712). The bonus is dated by the
+     * API with the JST stat date it was granted for: while that
+     * date is still today (JST), the player gets the ActionBar,
+     * the level-up sound and particles on top of the chat line.
+     * A bonus delivered late for a previous day — or one whose
+     * date cannot be read — folds into the chat record only,
+     * mirroring the quest catch-up rule. With effects off, the
+     * chat record still arrives.
+     */
+    public static RenderPlan planLoginBonus(PresentationEvent event, boolean effectsEnabled, LocalDate todayJst) {
+        Payload payload = event.payload();
+        List<String> chat = new ArrayList<>();
+        chat.add(loginBonusChatLine(payload));
+        if (!effectsEnabled || isStaleBonus(payload, todayJst)) {
+            return chatOnly(chat);
+        }
+        return new RenderPlan(
+                Presentation.ACTION_BAR,
+                null,
+                null,
+                "ログインボーナス +" + amount(payload.xp()) + " XP",
+                chat,
+                SoundProfile.LOGIN_BONUS,
+                ParticleProfile.LOGIN_BONUS);
+    }
+
+    private static boolean isStaleBonus(Payload payload, LocalDate todayJst) {
+        if (payload.date() == null || todayJst == null) {
+            return true;
+        }
+        try {
+            return LocalDate.parse(payload.date()).isBefore(todayJst);
+        } catch (DateTimeParseException exception) {
+            return true;
+        }
+    }
+
+    private static String loginBonusChatLine(Payload payload) {
+        StringBuilder line = new StringBuilder("ログインボーナス +")
+                .append(amount(payload.xp()))
+                .append(" XP を受け取りました！");
+        if (payload.totalXp() != null) {
+            line.append("（現在の合計 XP: ").append(payload.totalXp()).append("）");
+        }
+        return line.toString();
     }
 
     private static RenderPlan chatOnly(List<String> chat) {

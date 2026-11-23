@@ -3,6 +3,8 @@ package jp.ivrm.playerbridge.presentation;
 import com.mojang.brigadier.context.CommandContext;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -77,10 +79,15 @@ import org.slf4j.Logger;
  * player, then records it in the local delivered ledger and
  * queues the ack. Events that completed while the player was
  * offline are delivered as login catch-up: achievements get one
- * simplified Title, quest completions fold into chat only.</p>
+ * simplified Title, quest completions fold into chat only.
+ * Login bonuses (#1712) are graded by their JST stat date
+ * instead: today's bonus always gets its ActionBar + sound +
+ * particles, a previous day's bonus is chat only.</p>
  */
 public final class NeoForgePresentation {
     static final String OBJECTIVE_NAME = "ivrm_sidebar";
+    /** Login-bonus stat dates are JST dates (ivrm-web #1712). */
+    private static final ZoneId JST = ZoneId.of("Asia/Tokyo");
     private static final int RENDER_SAMPLE_TICKS = 20;
     private static final Duration EFFECT_SPACING = Duration.ofSeconds(2);
     private static final double POSITION_EPSILON = 0.0001D;
@@ -345,9 +352,17 @@ public final class NeoForgePresentation {
                         && effectsPreferences.effectsEnabled(player.getUUID());
                 for (PresentationEvent event : held) {
                     boolean catchUp = event.createdAt().isBefore(state.loggedInAt);
-                    RenderPlan plan = catchUp
-                            ? EffectText.planCatchUp(event, effectsOn)
-                            : EffectText.planLive(event, effectsOn);
+                    RenderPlan plan;
+                    if (event.isLoginBonus()) {
+                        // Graded by the bonus's JST stat date, not
+                        // by the login moment (#1712).
+                        plan = EffectText.planLoginBonus(
+                                event, effectsOn, LocalDate.ofInstant(now, JST));
+                    } else if (catchUp) {
+                        plan = EffectText.planCatchUp(event, effectsOn);
+                    } else {
+                        plan = EffectText.planLive(event, effectsOn);
+                    }
                     state.effectQueue.addLast(new QueuedEffect(event.eventId(), plan));
                 }
             }
@@ -400,19 +415,22 @@ public final class NeoForgePresentation {
         SoundEvent sound = switch (profile) {
             case NONE -> null;
             case SMALL -> SoundEvents.EXPERIENCE_ORB_PICKUP;
-            case LEVELUP -> SoundEvents.PLAYER_LEVELUP;
+            case LEVELUP, LOGIN_BONUS -> SoundEvents.PLAYER_LEVELUP;
             case CHALLENGE -> SoundEvents.UI_TOAST_CHALLENGE_COMPLETE;
         };
         if (sound == null) {
             return;
         }
+        // The login-bonus jingle plays softer than a level-up
+        // fanfare (#1712); every other profile is full volume.
+        float volume = profile == EffectText.SoundProfile.LOGIN_BONUS ? 0.7F : 1.0F;
         player.connection.send(new ClientboundSoundPacket(
                 Holder.direct(sound),
                 SoundSource.MASTER,
                 player.getX(),
                 player.getY(),
                 player.getZ(),
-                1.0F,
+                volume,
                 1.0F,
                 0L));
     }
@@ -427,6 +445,10 @@ public final class NeoForgePresentation {
             case SMALL -> {
                 particle = ParticleTypes.HAPPY_VILLAGER;
                 count = 8;
+            }
+            case LOGIN_BONUS -> {
+                particle = ParticleTypes.HAPPY_VILLAGER;
+                count = 12;
             }
             case FIREWORK -> {
                 particle = ParticleTypes.FIREWORK;
