@@ -1,10 +1,12 @@
 # Minecraft Presentation Module — Operations / Rollout
 
 This document covers the bridge-side presentation features of
-ivrm-web #1584 S3: the per-player sidebar and the
+ivrm-web #1584: the per-player sidebar and the
 `/ivrm today` / `/ivrm board` commands, rendered from the API's
 Presentation Snapshot (`POST /v1/minecraft/presentation/snapshot`,
-#1584 S2).
+#1584 S2), and — since S4 — the achievement effects delivered
+through the Presentation Outbox
+(`POST /v1/minecraft/presentation/events` + `/events/ack`).
 
 ## Safety model
 
@@ -18,6 +20,11 @@ API quest / achievement evaluation (source of truth)
   -> Presentation Snapshot (read-only, HMAC-signed polling)
   -> bridge PresentationCache (last good snapshot wins)
   -> per-player sidebar packets / /ivrm today chat output
+
+API completion / unlock ledgers
+  -> Presentation Outbox (deterministic event ids, S4)
+  -> bridge event polling -> render once -> local ledger + ack
+  -> Title / ActionBar / chat / sound / particles (achiever only)
 ```
 
 - Polling runs on a dedicated daemon thread; the server tick
@@ -59,6 +66,8 @@ must never be committed or logged.
 | --- | --- | --- |
 | `IVRM_PRESENTATION_ENABLED` | Enables the module | `false` |
 | `IVRM_PRESENTATION_SNAPSHOT_SECONDS` | Snapshot poll interval | `45` |
+| `IVRM_PRESENTATION_EVENT_POLL_SECONDS` | Outbox event poll interval (S4) | `15` |
+| `IVRM_PRESENTATION_EFFECTS_ENABLED` | Master switch for S4 effects (chat records still arrive while off) | `true` |
 | `IVRM_PRESENTATION_STALE_SECONDS` | How long a snapshot may render progress sections | `300` |
 
 Equivalent JVM properties use the `ivrm.presentation.*` names
@@ -78,24 +87,59 @@ login pulls the next poll forward.
 - `/ivrm board on|off`: per-player sidebar visibility,
   persisted across restarts.
 
-Durable state (display preferences only):
+- `/ivrm board on|off`: per-player sidebar visibility,
+  persisted across restarts.
+- `/ivrm effects on|off`: per-player achievement effects,
+  persisted across restarts (S4).
+
+Durable state (display preferences and duplicate suppression
+only — never game state):
 
 ```text
-config/ivrm/presentation/board.properties   # only opt-outs are stored
+config/ivrm/presentation/board.properties      # only opt-outs are stored
+config/ivrm/presentation/effects.properties    # only opt-outs are stored
+config/ivrm/presentation/delivered.properties  # handled outbox event ids (S4)
 ```
 
-## Not in this slice (S4)
+## Achievement effects (S4)
 
-Achievement celebration effects (Title / ActionBar / sound /
-particles) are **not** implemented here. They need the API-side
-Presentation Outbox and its event polling/ack flow (#1584 S4);
-the S2 snapshot carries current state only, no completion
-events, so there is nothing safe to celebrate from polling
-alone. `/ivrm effects on|off` also arrives with S4.
+The API mirrors quest completions, all-clears and achievement
+unlocks into its Presentation Outbox (deterministic event ids;
+the API's ledgers stay the only source of truth). The bridge
+polls the outbox every `IVRM_PRESENTATION_EVENT_POLL_SECONDS`
+while players are connected and renders each event **once, for
+the achiever only**:
 
-The snapshot also carries no member level/XP totals or
-Minecraft job, so the sidebar does not show them; adding them
-is an API-side snapshot extension, not a bridge change.
+| Event | Rendering |
+| --- | --- |
+| Daily quest completed | ActionBar + chat, small sound |
+| Weekly / monthly quest completed | ActionBar + chat, level-up sound, a few particles |
+| All-clear | Title + subtitle, challenge sound, firework particles |
+| Achievement unlocked | Title + subtitle; sound/particles graded by the API's effect profile (`celebration` / `grand`) |
+
+Delivery is at-least-once end to end and made exactly-once in
+practice by two acks: after rendering, the bridge records the
+event id in `delivered.properties` and acks it to the API; if
+an ack is lost, the re-polled event is suppressed by the local
+ledger (and acked again). Effects for one player are spaced at
+least 2 seconds apart.
+
+Offline catch-up (design §11-3): events that completed while
+the player was offline are delivered at their next login —
+achievements as one simplified Title each, quest completions
+as chat summary lines only. Events whose presentation window
+(`expiresAt`: end of the quest period, 7 days for unlocks) has
+closed are never rendered; the API sweeps them to expired.
+
+While `IVRM_PRESENTATION_EFFECTS_ENABLED` is off, or for a
+player who ran `/ivrm effects off`, events still produce their
+chat completion record and are acked — only the Title /
+ActionBar / sound / particles are skipped.
+
+The snapshot's `profile` section (member level / total XP /
+selected Minecraft job) is parsed-ready on the API side since
+S4; the sidebar does not render it yet — that display is a
+small follow-up, not a bridge contract change.
 
 ## Rollback
 

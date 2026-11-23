@@ -19,12 +19,22 @@ import java.time.Duration;
 public final class PresentationConfig {
     private final boolean enabled;
     private final int snapshotSeconds;
+    private final int eventPollSeconds;
+    private final boolean effectsEnabled;
     private final int staleSeconds;
     private final Path stateDir;
 
-    public PresentationConfig(boolean enabled, int snapshotSeconds, int staleSeconds, Path stateDir) {
+    public PresentationConfig(
+            boolean enabled,
+            int snapshotSeconds,
+            int eventPollSeconds,
+            boolean effectsEnabled,
+            int staleSeconds,
+            Path stateDir) {
         this.enabled = enabled;
         this.snapshotSeconds = snapshotSeconds;
+        this.eventPollSeconds = eventPollSeconds;
+        this.effectsEnabled = effectsEnabled;
         this.staleSeconds = staleSeconds;
         this.stateDir = stateDir;
     }
@@ -33,10 +43,15 @@ public final class PresentationConfig {
         boolean enabled = boolSetting("IVRM_PRESENTATION_ENABLED", "ivrm.presentation.enabled", false);
         int snapshotSeconds = intSetting(
                 "IVRM_PRESENTATION_SNAPSHOT_SECONDS", "ivrm.presentation.snapshotSeconds", 45, 15, 3600);
+        int eventPollSeconds = intSetting(
+                "IVRM_PRESENTATION_EVENT_POLL_SECONDS", "ivrm.presentation.eventPollSeconds", 15, 5, 3600);
+        boolean effectsEnabled = boolSetting(
+                "IVRM_PRESENTATION_EFFECTS_ENABLED", "ivrm.presentation.effectsEnabled", true);
         int staleSeconds = intSetting(
                 "IVRM_PRESENTATION_STALE_SECONDS", "ivrm.presentation.staleSeconds", 300, 30, 3600);
         Path stateDir = gameDir.resolve("config").resolve("ivrm").resolve("presentation");
-        return new PresentationConfig(enabled, snapshotSeconds, staleSeconds, stateDir);
+        return new PresentationConfig(
+                enabled, snapshotSeconds, eventPollSeconds, effectsEnabled, staleSeconds, stateDir);
     }
 
     private static String setting(String environmentName, String propertyName, String fallback) {
@@ -83,6 +98,22 @@ public final class PresentationConfig {
         return snapshotSeconds;
     }
 
+    /** Poll interval for the presentation outbox events (design default: 15s). */
+    public int eventPollSeconds() {
+        return eventPollSeconds;
+    }
+
+    /**
+     * Master switch for the S4 achievement effects (Title /
+     * ActionBar / sound / particles). While off, delivered
+     * events still produce their chat record and are acked, but
+     * nothing is rendered over the game. Per-player opt-out via
+     * {@code /ivrm effects off} lives in EffectsPreferences.
+     */
+    public boolean effectsEnabled() {
+        return effectsEnabled;
+    }
+
     /**
      * How long a fetched snapshot may keep rendering its dynamic
      * progress sections. Beyond this the sidebar degrades to the
@@ -102,9 +133,21 @@ public final class PresentationConfig {
         return stateDir.resolve("board.properties");
     }
 
+    /** File holding the per-player effects on/off preferences (S4). */
+    public Path effectsPreferencesPath() {
+        return stateDir.resolve("effects.properties");
+    }
+
+    /** File holding the local delivered-event ledger (S4). */
+    public Path deliveredLedgerPath() {
+        return stateDir.resolve("delivered.properties");
+    }
+
     public String summary() {
         return "enabled=" + enabled
                 + ", snapshotSeconds=" + snapshotSeconds
+                + ", eventPollSeconds=" + eventPollSeconds
+                + ", effectsEnabled=" + effectsEnabled
                 + ", staleSeconds=" + staleSeconds;
     }
 }

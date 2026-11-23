@@ -6,6 +6,8 @@ import jp.ivrm.playerbridge.activity.ActivityRuntime;
 import jp.ivrm.playerbridge.activity.FtbQuestsActivityEvents;
 import jp.ivrm.playerbridge.activity.NeoForgeActivityEvents;
 import jp.ivrm.playerbridge.presentation.BoardPreferences;
+import jp.ivrm.playerbridge.presentation.DeliveredEventsLedger;
+import jp.ivrm.playerbridge.presentation.EffectsPreferences;
 import jp.ivrm.playerbridge.presentation.NeoForgePresentation;
 import jp.ivrm.playerbridge.presentation.PresentationCache;
 import jp.ivrm.playerbridge.presentation.PresentationConfig;
@@ -88,7 +90,12 @@ public final class IvrmPlayerBridge {
             PresentationCache cache = new PresentationCache();
             PresentationRuntime runtime = new PresentationRuntime(identity, config, cache, LOGGER);
             BoardPreferences preferences = new BoardPreferences(config.boardPreferencesPath(), LOGGER);
-            NeoForge.EVENT_BUS.register(new NeoForgePresentation(runtime, cache, preferences, identity, LOGGER));
+            EffectsPreferences effectsPreferences =
+                    new EffectsPreferences(config.effectsPreferencesPath(), LOGGER);
+            DeliveredEventsLedger deliveredLedger =
+                    new DeliveredEventsLedger(config.deliveredLedgerPath(), LOGGER);
+            NeoForge.EVENT_BUS.register(new NeoForgePresentation(
+                    runtime, cache, preferences, effectsPreferences, deliveredLedger, identity, LOGGER));
             runtime.start();
         } catch (RuntimeException exception) {
             LOGGER.error(
