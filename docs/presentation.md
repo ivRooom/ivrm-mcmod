@@ -1,7 +1,8 @@
 # Minecraft Presentation Module — Operations / Rollout
 
 This document covers the bridge-side presentation features of
-ivrm-web #1584: the per-player sidebar and the
+ivrm-web #1584: the per-player TAB-list footer (the default
+board surface since #33) and sidebar, plus the
 `/ivrm today` / `/ivrm board` commands, rendered from the API's
 Presentation Snapshot (`POST /v1/minecraft/presentation/snapshot`,
 #1584 S2), and — since S4 — the achievement effects delivered
@@ -19,7 +20,7 @@ exactly as the Web member pages read them.
 API quest / achievement evaluation (source of truth)
   -> Presentation Snapshot (read-only, HMAC-signed polling)
   -> bridge PresentationCache (last good snapshot wins)
-  -> per-player sidebar packets / /ivrm today chat output
+  -> per-player TAB footer / sidebar packets / /ivrm today chat output
 
 API completion / unlock ledgers
   -> Presentation Outbox (deterministic event ids, S4)
@@ -35,11 +36,22 @@ API completion / unlock ledgers
   never registered in the server scoreboard, so no player ever
   receives another player's progress, and TAB's scoreboard stays
   disabled and untouched.
+- The TAB footer is sent with `ClientboundTabListPacket`
+  **only to the player it belongs to**. That packet couples
+  header and footer, so the bridge always sends an **empty
+  header**: while the module is enabled it owns the tab-list
+  customisation. The TAB plugin foreseen by #1584 S1 is not
+  deployed; before it (or anything else that sets a tab-list
+  header/footer) is introduced, header/footer ownership must
+  be coordinated — as long as both sides send the packet,
+  each update overwrites the other side's field.
 - A failed fetch keeps the previous snapshot. Progress sections
   render while the snapshot is within the stale window
   (default 300s from fetch); beyond that the sidebar degrades
   to the server basics (online/active counts, world day) so
-  stale progress is never shown as current.
+  stale progress is never shown as current, while the TAB
+  footer is cleared entirely (an empty footer is sent once)
+  so no stale summary lingers on the glance surface.
 - Disabling the module (or the API-side
   `MINECRAFT_PRESENTATION_ENABLED` flag, which makes the API
   answer 503) removes the dynamic sections; Minecraft and the
@@ -77,18 +89,30 @@ login pulls the next poll forward.
 
 ## Player-facing surface
 
-- Sidebar (vanilla scoreboard, per player): online/active
-  counts, world day, today's Minecraft daily progress
-  (incomplete items first, at most 3), achievement totals with
-  the single closest next achievement, and the time until the
-  daily reset from the API's `dailyResetsAt`.
+- TAB-list footer (default board surface, #33): the same
+  per-player summary as the sidebar — online/active counts,
+  world day, today's Minecraft daily progress (incomplete
+  items first, at most 3), achievement totals with the single
+  closest next achievement, and the time until the daily
+  reset from the API's `dailyResetsAt`. It is visible only
+  while the player holds TAB, is sent on login and whenever
+  the rendered text changes, and is cleared while the
+  snapshot is outside the stale window. The footer is not
+  affected by `/ivrm board`.
+- Sidebar (vanilla scoreboard, per player): the same summary
+  as the TAB footer, always on screen. **Opt-in since #33**
+  (default off) — before #33 it was on by default and proved
+  too intrusive in play.
 - `/ivrm today`: full daily list and up to 3 next achievements
   in the player's own chat.
 - `/ivrm board on|off`: per-player sidebar visibility,
-  persisted across restarts.
-
-- `/ivrm board on|off`: per-player sidebar visibility,
-  persisted across restarts.
+  persisted across restarts. Only opt-ins are stored.
+  Migration note: files written before #33 stored opt-outs
+  (`off` rows); those rows are dropped on first load. Their
+  owners keep the same effective state — sidebar hidden —
+  because off is now the default, and the old model never
+  recorded an opt-in, so nobody is silently kept on: a player
+  who wants the sidebar runs `/ivrm board on` once.
 - `/ivrm effects on|off`: per-player achievement effects,
   persisted across restarts (S4).
 
@@ -96,7 +120,7 @@ Durable state (display preferences and duplicate suppression
 only — never game state):
 
 ```text
-config/ivrm/presentation/board.properties      # only opt-outs are stored
+config/ivrm/presentation/board.properties      # only opt-ins are stored
 config/ivrm/presentation/effects.properties    # only opt-outs are stored
 config/ivrm/presentation/delivered.properties  # handled outbox event ids (S4)
 ```
@@ -155,5 +179,7 @@ small follow-up, not a bridge contract change.
 1. Set `IVRM_PRESENTATION_ENABLED=false` and restart the
    affected Minecraft server.
 2. The sidebar disappears (a stale client-side objective is
-   dropped on disconnect); TAB and the Activity sender are
-   untouched. `config/ivrm/presentation/` may be left in place.
+   dropped on disconnect) and the TAB footer stops updating
+   (the client drops the tab-list customisation on
+   disconnect); the Activity sender is untouched.
+   `config/ivrm/presentation/` may be left in place.

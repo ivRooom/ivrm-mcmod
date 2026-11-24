@@ -37,6 +37,7 @@ import net.minecraft.network.protocol.game.ClientboundSetSubtitleTextPacket;
 import net.minecraft.network.protocol.game.ClientboundSetTitleTextPacket;
 import net.minecraft.network.protocol.game.ClientboundSetTitlesAnimationPacket;
 import net.minecraft.network.protocol.game.ClientboundSoundPacket;
+import net.minecraft.network.protocol.game.ClientboundTabListPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvent;
@@ -56,18 +57,30 @@ import org.slf4j.Logger;
 /**
  * NeoForge adapter for the Presentation module (#1584 S3).
  *
- * <p>Renders each player's own sidebar with vanilla scoreboard
- * packets sent only to that player: the objective is a detached
- * client-side one (never registered in the server scoreboard),
- * so no other player ever receives someone else's progress, and
- * TAB's scoreboard stays disabled and untouched. Packet sends
- * happen on the server thread from the tick handler, and only
- * for lines that actually changed. HTTP stays on the poller
+ * <p>The default board surface is the TAB-list footer (#33):
+ * the same per-player summary as the sidebar, sent with
+ * {@code ClientboundTabListPacket} only to the player it
+ * belongs to and visible only while that player holds TAB, so
+ * it never occupies the screen. The packet couples header and
+ * footer, so the header is always sent empty — while this
+ * module is enabled it owns the tab-list customisation (see
+ * docs/presentation.md for the coordination a future TAB
+ * plugin will need).</p>
+ *
+ * <p>The sidebar is opt-in since #33. When a player enables
+ * it, it renders with vanilla scoreboard packets sent only to
+ * that player: the objective is a detached client-side one
+ * (never registered in the server scoreboard), so no other
+ * player ever receives someone else's progress, and TAB's
+ * scoreboard stays disabled and untouched. Packet sends happen
+ * on the server thread from the tick handler, and only for
+ * content that actually changed. HTTP stays on the poller
  * thread inside {@link PresentationRuntime}.</p>
  *
  * <p>Commands: {@code /ivrm today} prints the full daily /
  * achievement summary to the player's own chat;
- * {@code /ivrm board on|off} toggles the sidebar persistently;
+ * {@code /ivrm board on|off} toggles the sidebar persistently
+ * (off by default; the TAB footer is not affected);
  * {@code /ivrm effects on|off} toggles the S4 achievement
  * effects (Title / sound / particles) persistently — the chat
  * completion record still arrives while effects are off.</p>
@@ -197,16 +210,21 @@ public final class NeoForgePresentation {
             if (state == null) {
                 continue;
             }
-            if (!preferences.boardEnabled(player.getUUID())) {
-                removeSidebar(player, state);
-                continue;
-            }
             LocalInfo local = new LocalInfo(
                     online.size(),
                     server.getMaxPlayers(),
                     active,
                     WorldTime.worldDay(player.level().getGameTime()));
             PlayerEntry entry = cache.player(player.getUUID()).orElse(null);
+            // The TAB-list footer is the default board surface
+            // (#33) and is sent regardless of the sidebar
+            // opt-in below.
+            applyFooter(player, state, TabFooterText.renderFooter(
+                    local, entry, usable, resetsAt.orElse(null), now));
+            if (!preferences.boardEnabled(player.getUUID())) {
+                removeSidebar(player, state);
+                continue;
+            }
             List<String> lines = SidebarLines.renderSidebar(
                     local, entry, usable, resetsAt.orElse(null), now);
             applyLines(player, state, lines);
@@ -475,6 +493,34 @@ public final class NeoForgePresentation {
     private record QueuedEffect(String eventId, RenderPlan plan) {
     }
 
+    /**
+     * Sends the TAB-list footer when its text changed (#33).
+     * The packet couples header and footer, so the header is
+     * always sent empty. An empty footer is a real send, not a
+     * skip: it clears a previously shown footer when the
+     * snapshot leaves the stale window. No clear is needed at
+     * logout — the client drops the tab-list customisation
+     * with the connection, and a fresh login starts from a
+     * fresh {@link RenderState} whose first sample re-sends.
+     */
+    private void applyFooter(ServerPlayer player, RenderState state, String footer) {
+        if (footer.equals(state.lastFooter)) {
+            return;
+        }
+        try {
+            player.connection.send(new ClientboundTabListPacket(
+                    Component.empty(), Component.literal(footer)));
+            state.lastFooter = footer;
+        } catch (RuntimeException exception) {
+            // Same disconnect-race posture as the sidebar: log
+            // the type only and retry on the next sample.
+            logger.warn(
+                    "IVRM tab footer update failed for a player: reasonType={}",
+                    exception.getClass().getSimpleName());
+            state.lastFooter = null;
+        }
+    }
+
     private void applyLines(ServerPlayer player, RenderState state, List<String> lines) {
         if (state.objectiveShown && lines.equals(state.lastLines)) {
             return;
@@ -541,6 +587,7 @@ public final class NeoForgePresentation {
     private static final class RenderState {
         private boolean objectiveShown;
         private List<String> lastLines = List.of();
+        private String lastFooter;
         private double x;
         private double y;
         private double z;
