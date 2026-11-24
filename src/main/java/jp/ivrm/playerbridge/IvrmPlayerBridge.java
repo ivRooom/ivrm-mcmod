@@ -5,6 +5,9 @@ import jp.ivrm.playerbridge.activity.ActivityConfig;
 import jp.ivrm.playerbridge.activity.ActivityRuntime;
 import jp.ivrm.playerbridge.activity.FtbQuestsActivityEvents;
 import jp.ivrm.playerbridge.activity.NeoForgeActivityEvents;
+import jp.ivrm.playerbridge.periodquests.NeoForgePeriodQuests;
+import jp.ivrm.playerbridge.periodquests.PeriodQuestsConfig;
+import jp.ivrm.playerbridge.periodquests.PeriodQuestsRuntime;
 import jp.ivrm.playerbridge.presentation.BoardPreferences;
 import jp.ivrm.playerbridge.presentation.DeliveredEventsLedger;
 import jp.ivrm.playerbridge.presentation.EffectsPreferences;
@@ -37,6 +40,7 @@ public final class IvrmPlayerBridge {
         LOGGER.info("IVRM Player Bridge initialized (server-only foundation)");
         initializeActivitySender();
         initializePresentation();
+        initializePeriodQuests();
     }
 
     private static void initializeActivitySender() {
@@ -100,6 +104,57 @@ public final class IvrmPlayerBridge {
         } catch (RuntimeException exception) {
             LOGGER.error(
                     "IVRM Presentation module could not initialize and remains disabled: reasonType={}",
+                    exception.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Period quest sync module (#1752 S3): polls the API's
+     * generated period chapters and swaps the FTB Quests chapter
+     * files, reloading the book when the payload hash changes.
+     *
+     * <p>Independent of the other modules' enable flags — it
+     * reuses the sender's server identity (the API authorizes
+     * the endpoint with the same per-server secret) but has its
+     * own {@code IVRM_PERIOD_QUESTS_ENABLED} flag, default off.
+     * Only the main server is a sync target (the API rejects
+     * other roles), and without FTB Quests there is no book to
+     * sync, so both cases stay disabled with an info log rather
+     * than an error. As with the other modules, any
+     * initialization failure only disables this module and is
+     * logged by exception type, never by message.</p>
+     */
+    private static void initializePeriodQuests() {
+        try {
+            java.nio.file.Path gameDir = FMLPaths.GAMEDIR.get();
+            PeriodQuestsConfig config = PeriodQuestsConfig.load(gameDir);
+            if (!config.enabled()) {
+                LOGGER.info("IVRM Period quests sync is disabled: {}", config.summary());
+                return;
+            }
+            if (!ModList.get().isLoaded("ftbquests")) {
+                LOGGER.info("FTB Quests not loaded; period quests sync remains disabled");
+                return;
+            }
+            ActivityConfig identity = ActivityConfig.load(gameDir);
+            if (identity.serverId().isBlank() || identity.secret().isBlank()) {
+                throw new IllegalArgumentException(
+                        "IVRM_ACTIVITY_SERVER_ID and IVRM_ACTIVITY_SERVER_SECRET are required"
+                                + " when the period quests sync is enabled");
+            }
+            if (!"main".equals(identity.serverRole())) {
+                LOGGER.info(
+                        "IVRM Period quests sync targets the main server only; skipping for serverRole={}",
+                        identity.serverRole());
+                return;
+            }
+
+            PeriodQuestsRuntime runtime = new PeriodQuestsRuntime(identity, config, LOGGER);
+            NeoForge.EVENT_BUS.register(new NeoForgePeriodQuests(runtime, LOGGER));
+            runtime.start();
+        } catch (RuntimeException exception) {
+            LOGGER.error(
+                    "IVRM Period quests sync could not initialize and remains disabled: reasonType={}",
                     exception.getClass().getSimpleName());
         }
     }
